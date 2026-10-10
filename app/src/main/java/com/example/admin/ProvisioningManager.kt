@@ -60,9 +60,9 @@ class ProvisioningManager(private val context: Context) {
     }
 
     /**
-     * Precisely locates the Work Profile user handle (P1.01 fix).
-     * Filters against LauncherApps profiles and verifies quiet mode / profile owner capability,
-     * avoiding false positives on Samsung Dual Messenger (user 95) or system containers.
+     * Precisely locates the Work Profile user handle.
+     * Filters against LauncherApps profiles, filters out OEM clones (Samsung Dual Messenger user 95),
+     * and verifies enterprise managed profile status.
      */
     fun getWorkProfileUserHandle(): UserHandle? {
         val myHandle = Process.myUserHandle()
@@ -75,14 +75,30 @@ class ProvisioningManager(private val context: Context) {
             for (handle in candidateProfiles) {
                 if (handle == myHandle) continue
 
-                // Verify quiet mode or managed profile semantics
+                // Explicitly filter out Samsung Dual Messenger (User 95)
+                val handleStr = handle.toString()
+                if (handleStr.contains("95") || handle.hashCode() == 95) {
+                    Log.d("ProvisioningManager", "Skipping Samsung Dual Messenger container ($handle)")
+                    continue
+                }
+
+                // Verify quiet mode and profile semantics
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     try {
-                        // isQuietModeEnabled is specifically valid for Managed Work Profiles
+                        // In Android, only Managed Work Profiles support quiet mode requests.
+                        // Clone profiles and secondary personal users throw IllegalArgumentException.
                         userManager.isQuietModeEnabled(handle)
+
+                        // Ensure user is not an unmanaged clone/guest profile
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            if (!userManager.isProfile) {
+                                continue
+                            }
+                        }
+
                         return handle
                     } catch (e: Exception) {
-                        Log.d("ProvisioningManager", "User $handle is not a standard work profile: ${e.message}")
+                        Log.d("ProvisioningManager", "User $handle is not a valid managed work profile: ${e.message}")
                     }
                 } else {
                     return handle

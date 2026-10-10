@@ -75,28 +75,12 @@ class AppRepository(
             )
         }
 
-        // 2. Add saved cloned packages (for single-user / testing fallback mode)
+        // 2. Only if provisioned as profile owner or work profile is active, verify cloned packages
         for (pkg in savedPackages) {
             if (workPackages.contains(pkg) || pkg == context.packageName) continue
-            try {
-                val appInfo = packageManager.getApplicationInfo(pkg, 0)
-                val label = packageManager.getApplicationLabel(appInfo).toString()
-                val icon = packageManager.getApplicationIcon(appInfo)
-                val launchIntent = packageManager.getLaunchIntentForPackage(pkg)
-                val className = launchIntent?.component?.className ?: ""
-
-                list.add(
-                    ClonedApp(
-                        packageName = pkg,
-                        appLabel = label,
-                        componentClassName = className,
-                        isWorkProfile = false,
-                        isSystemApp = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
-                        icon = icon
-                    )
-                )
-            } catch (e: Exception) {
-                Log.w(TAG, "Cloned package $pkg not currently found on device")
+            // Do not deceptively show non-work-profile apps as isolated if not in work profile
+            if (workActivities.isNotEmpty()) {
+                continue
             }
         }
 
@@ -189,10 +173,15 @@ class AppRepository(
     }
 
     /**
-     * Launches a cloned application instance in its isolated profile.
+     * Launches a cloned application instance strictly in its isolated profile.
+     * Fail-closed: Never falls back to personal profile (User 0)!
      */
     fun launchClonedApp(app: ClonedApp, bounds: Rect? = null): Boolean {
-        val workHandle = provisioningManager.getWorkProfileUserHandle() ?: Process.myUserHandle()
+        val workHandle = provisioningManager.getWorkProfileUserHandle()
+        if (workHandle == null) {
+            Log.e(TAG, "Cannot launch app ${app.packageName}: Managed Work Profile is not provisioned or not found.")
+            return false
+        }
         val component = ComponentName(app.packageName, app.componentClassName)
         return profileManager.launchApp(component, workHandle, bounds)
     }

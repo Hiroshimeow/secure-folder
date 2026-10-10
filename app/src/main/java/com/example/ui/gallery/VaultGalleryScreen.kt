@@ -49,6 +49,12 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.ui.viewinterop.AndroidView
+import android.widget.MediaController
+import android.widget.VideoView
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -461,22 +467,72 @@ fun VaultGalleryScreen(
                                     contentDescription = item.title,
                                     modifier = Modifier.fillMaxSize()
                                 )
+                            } else if (item.itemType == VaultItemType.VIDEO) {
+                                // Full in-app Video Player with temporary isolated playback stream
+                                val videoFile = remember(item.id, state.decryptedBytes) {
+                                    val tempVideo = java.io.File(context.cacheDir, "sec_preview_${item.id}.mp4")
+                                    state.decryptedBytes?.let { tempVideo.writeBytes(it) }
+                                    tempVideo
+                                }
+                                DisposableEffect(videoFile) {
+                                    onDispose {
+                                        if (videoFile.exists()) {
+                                            videoFile.delete()
+                                        }
+                                    }
+                                }
+
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .aspectRatio(16f / 9f)
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .background(Color.Black),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    AndroidView(
+                                        factory = { ctx ->
+                                            VideoView(ctx).apply {
+                                                setVideoURI(Uri.fromFile(videoFile))
+                                                val mediaController = MediaController(ctx)
+                                                mediaController.setAnchorView(this)
+                                                setMediaController(mediaController)
+                                                setOnPreparedListener { mp ->
+                                                    mp.isLooping = true
+                                                    start()
+                                                }
+                                            }
+                                        },
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
                             } else {
+                                // Document / Text / PDF preview
+                                val textPreview = remember(state.decryptedBytes) {
+                                    state.decryptedBytes?.let {
+                                        try {
+                                            String(it, Charsets.UTF_8).take(8000)
+                                        } catch (e: Exception) {
+                                            null
+                                        }
+                                    }
+                                }
+
                                 Column(
                                     horizontalAlignment = Alignment.CenterHorizontally,
                                     modifier = Modifier
-                                        .padding(24.dp)
+                                        .padding(20.dp)
                                         .clip(RoundedCornerShape(20.dp))
                                         .background(OneUiDarkCard)
-                                        .padding(24.dp)
+                                        .padding(20.dp)
                                 ) {
                                     Icon(
-                                        imageVector = if (item.itemType == VaultItemType.VIDEO) Icons.Default.VideoLibrary else Icons.Default.Description,
+                                        imageVector = Icons.Default.Description,
                                         contentDescription = null,
-                                        tint = if (item.itemType == VaultItemType.VIDEO) OneUiLockRed else Color(0xFF9B51E0),
-                                        modifier = Modifier.size(64.dp)
+                                        tint = Color(0xFF9B51E0),
+                                        modifier = Modifier.size(52.dp)
                                     )
-                                    Spacer(modifier = Modifier.height(16.dp))
+                                    Spacer(modifier = Modifier.height(12.dp))
                                     Text(
                                         text = item.title,
                                         color = Color.White,
@@ -485,18 +541,33 @@ fun VaultGalleryScreen(
                                     )
                                     Spacer(modifier = Modifier.height(8.dp))
                                     Text(
-                                        text = "Loại MIME: ${item.mimeType}",
+                                        text = "Loại MIME: ${item.mimeType} • ${item.fileSize / 1024} KB",
                                         color = OneUiDarkTextSecondary,
                                         style = MaterialTheme.typography.bodySmall
                                     )
-                                    Text(
-                                        text = "Kích thước: ${item.fileSize / 1024} KB",
-                                        color = OneUiDarkTextSecondary,
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
+
+                                    if (!textPreview.isNullOrBlank()) {
+                                        Spacer(modifier = Modifier.height(16.dp))
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(200.dp)
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .background(OneUiDarkSurface)
+                                                .padding(12.dp)
+                                                .verticalScroll(rememberScrollState())
+                                        ) {
+                                            Text(
+                                                text = textPreview,
+                                                color = OneUiDarkTextPrimary,
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                        }
+                                    }
+
                                     Spacer(modifier = Modifier.height(12.dp))
                                     Text(
-                                        text = "✓ Đã xác minh giải mã phần cứng AES-256-GCM an toàn",
+                                        text = "✓ Đã xác minh giải mã an toàn AES-256-GCM",
                                         color = OneUiTealBright,
                                         style = MaterialTheme.typography.labelSmall
                                     )

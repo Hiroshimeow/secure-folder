@@ -99,12 +99,30 @@ class ProfileManager(
     }
 
     /**
-     * Unclones / hides app from the Managed Profile (P1.02 fix).
+     * Unclones / uninstalls app from the Managed Profile.
+     * Uses PackageInstaller session for true profile uninstallation and data wipe,
+     * along with setApplicationHidden.
      */
     fun uncloneApp(packageName: String): Boolean {
-        if (!provisioningManager.isProfileOwner()) return true
+        if (!provisioningManager.isProfileOwner()) {
+            Log.w(TAG, "Cannot unclone app $packageName: Not Profile Owner")
+            return false
+        }
         return try {
             dpm.setApplicationHidden(adminComponent, packageName, true)
+            try {
+                val packageInstaller = context.packageManager.packageInstaller
+                val intent = Intent("com.example.UNINSTALL_STATUS")
+                val pendingIntent = android.app.PendingIntent.getBroadcast(
+                    context,
+                    0,
+                    intent,
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+                )
+                packageInstaller.uninstall(packageName, pendingIntent.intentSender)
+            } catch (e: Exception) {
+                Log.w(TAG, "PackageInstaller uninstall triggered: ${e.message}")
+            }
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to hide/uninstall app $packageName in managed profile", e)

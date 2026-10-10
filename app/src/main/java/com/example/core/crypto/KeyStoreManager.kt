@@ -1,15 +1,17 @@
 package com.example.core.crypto
 
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import java.security.KeyStore
+import java.security.KeyStoreException
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 
 /**
  * Hardware-backed Android KeyStore Manager.
  * Generates and manages hardware-isolated AES-256 keys inside TEE / StrongBox.
- * Supports graceful fallback for local JVM/Robolectric test environments.
+ * Fail-closed: Never silently falls back to in-memory keys on production devices!
  */
 class KeyStoreManager {
 
@@ -19,34 +21,52 @@ class KeyStoreManager {
         private const val KEY_SIZE = 256
     }
 
+    private val isRunningInTestEnvironment: Boolean by lazy {
+        try {
+            Build.FINGERPRINT.contains("robolectric", ignoreCase = true) ||
+                    System.getProperty("java.vm.name")?.contains("Robolectric", ignoreCase = true) == true ||
+                    Build.HARDWARE.contains("robolectric", ignoreCase = true) ||
+                    System.getProperty("is.testing") == "true"
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     private val keyStore: KeyStore? by lazy {
         try {
             KeyStore.getInstance(ANDROID_KEYSTORE).apply {
                 load(null)
             }
         } catch (e: Exception) {
-            // AndroidKeyStore is not present in pure JVM / Robolectric environment
-            null
+            if (isRunningInTestEnvironment) {
+                null
+            } else {
+                throw KeyStoreException("AndroidKeyStore hardware provider failure on device: ${e.message}", e)
+            }
         }
     }
 
-    // JVM/Robolectric test fallback in-memory key
-    private var jvmFallbackKey: SecretKey? = null
+    // JVM/Robolectric test fallback in-memory key - strictly restricted to unit tests
+    private var jvmTestOnlyKey: SecretKey? = null
 
     /**
      * Retrieves the master SecretKey, or generates a new one if not present.
+     * Enforces fail-closed semantics on production devices: Never uses in-memory keys on real devices!
      */
     @Synchronized
     fun getOrCreateMasterKey(): SecretKey {
         val ks = keyStore
         if (ks == null) {
-            // JVM unit test fallback
-            if (jvmFallbackKey == null) {
-                val kgen = KeyGenerator.getInstance("AES")
-                kgen.init(KEY_SIZE)
-                jvmFallbackKey = kgen.generateKey()
+            if (isRunningInTestEnvironment) {
+                if (jvmTestOnlyKey == null) {
+                    val kgen = KeyGenerator.getInstance("AES")
+                    kgen.init(KEY_SIZE)
+                    jvmTestOnlyKey = kgen.generateKey()
+                }
+                return jvmTestOnlyKey!!
+            } else {
+                throw KeyStoreException("AndroidKeyStore is unavailable. In-memory keys are strictly forbidden on production hardware.")
             }
-            return jvmFallbackKey!!
         }
 
         if (!ks.containsAlias(KEY_ALIAS)) {
@@ -85,6 +105,6 @@ class KeyStoreManager {
         if (ks != null && ks.containsAlias(KEY_ALIAS)) {
             ks.deleteEntry(KEY_ALIAS)
         }
-        jvmFallbackKey = null
+        jvmTestOnlyKey = null
     }
 }

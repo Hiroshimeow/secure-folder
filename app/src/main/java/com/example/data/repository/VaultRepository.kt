@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.MediaStore
+import android.util.AtomicFile
 import android.util.Log
 import com.example.core.crypto.VaultCipher
 import com.example.data.model.VaultItemType
@@ -14,6 +15,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -38,9 +41,15 @@ data class SafeImportResult(
 )
 
 /**
- * Repository for Hardware-Encrypted Media & Document Vault.
+ * Isolated Storage Engine and AES-256 Vault Repository.
  * All files are stored with AES-256-GCM authentication in isolated internal storage.
  * Enforces strict Safe Copy & Safe Move semantics with destination integrity verification.
+ * 
+ * Production Hardening:
+ * 1. Atomic Index Commit: Uses Android's AtomicFile to guarantee index durability on crash/reboot.
+ * 2. 100% Cryptographic Wipe: Overwrites all file bytes with random data, flushes, syncs, and deletes.
+ * 3. Streaming AEAD verification: Verifies full stream integrity without buffering in RAM.
+ * 4. Concurrency control via Mutex.
  */
 class VaultRepository(
     private val context: Context,
@@ -57,11 +66,11 @@ class VaultRepository(
         if (!exists()) mkdirs()
     }
 
+    private val atomicIndexFile = AtomicFile(File(vaultDir, INDEX_FILE))
+    private val vaultMutex = Mutex()
+
     private val _vaultItems = MutableStateFlow<List<VaultMediaItem>>(emptyList())
     val vaultItems: StateFlow<List<VaultMediaItem>> = _vaultItems.asStateFlow()
-
-    // P1.08 fix: Index is NOT automatically decrypted in Application init while vault is locked.
-    // It is decrypted only after successful user authentication via loadVaultIndex().
 
     fun clearVaultCacheOnLock() {
         _vaultItems.value = emptyList()
@@ -70,12 +79,15 @@ class VaultRepository(
     @Synchronized
     fun loadVaultIndex() {
         try {
-            val indexFile = File(vaultDir, INDEX_FILE)
-            if (!indexFile.exists()) {
+            if (!atomicIndexFile.baseFile.exists()) {
                 _vaultItems.value = emptyList()
                 return
             }
-            val encryptedBytes = indexFile.readBytes()
+            val encryptedBytes = atomicIndexFile.readFully()
+            if (encryptedBytes.isEmpty()) {
+                _vaultItems.value = emptyList()
+                return
+            }
             val decryptedBytes = vaultCipher.decrypt(encryptedBytes)
             val jsonStr = String(decryptedBytes, Charsets.UTF_8)
             val jsonArray = JSONArray(jsonStr)
@@ -104,8 +116,8 @@ class VaultRepository(
     }
 
     /**
-     * P0.07 fix: Atomic index save that throws on failure, preventing index corruption
-     * and ensuring source files are never deleted unless index is durably committed!
+     * Atomic index commit using AtomicFile.
+     * Prevents data loss during power cuts or unexpected crashes.
      */
     @Throws(IOException::class)
     private fun saveVaultIndex() {
@@ -127,23 +139,25 @@ class VaultRepository(
         }
         val plainBytes = jsonArray.toString().toByteArray(Charsets.UTF_8)
         val encryptedBytes = vaultCipher.encrypt(plainBytes)
-        val indexFile = File(vaultDir, INDEX_FILE)
-        val tempIndex = File(vaultDir, "$INDEX_FILE.tmp")
-        tempIndex.writeBytes(encryptedBytes)
 
-        if (!tempIndex.renameTo(indexFile)) {
-            indexFile.delete()
-            if (!tempIndex.renameTo(indexFile)) {
-                throw IOException("Atomic index rename failed")
+        var fos: FileOutputStream? = null
+        try {
+            fos = atomicIndexFile.startWrite()
+            fos.write(encryptedBytes)
+            atomicIndexFile.finishWrite(fos)
+        } catch (e: Exception) {
+            if (fos != null) {
+                atomicIndexFile.failWrite(fos)
             }
+            throw IOException("Atomic index commit failed", e)
         }
     }
 
     /**
      * Safe Import Pipeline:
-     * 1. Read input stream from source URI with resource auto-close (P1.11 fix).
-     * 2. Encrypt stream directly into isolated disk file (<id>.enc).
-     * 3. Perform destination readback verification (ensure AES-GCM tag is valid).
+     * 1. Read input stream from source URI with resource auto-close.
+     * 2. Encrypt stream directly into isolated disk file (<id>.enc) via Chunked AEAD.
+     * 3. Perform destination readback integrity verification via streaming (Zero RAM bloat).
      * 4. Atomic commit to index.
      * 5. If mode is MOVE:
      *    - Request OS consent via MediaStore.createDeleteRequest (Android 11+)
@@ -156,180 +170,201 @@ class VaultRepository(
         mimeType: String,
         mode: ImportMode
     ): Result<SafeImportResult> = withContext(Dispatchers.IO) {
-        try {
-            val id = UUID.randomUUID().toString()
-            val encFileName = "$id.enc"
-            val targetFile = File(vaultDir, encFileName)
-
-            val openStream = context.contentResolver.openInputStream(uri)
-                ?: return@withContext Result.failure(Exception("Cannot open stream for URI $uri"))
-
-            // P1.11 fix: Always properly close input stream via .use
-            openStream.use { inputStream ->
-                FileOutputStream(targetFile).use { outStream ->
-                    vaultCipher.encryptStream(inputStream, outStream)
-                }
-            }
-
-            // Readback verification: ensure file can be successfully decrypted and authenticated
+        vaultMutex.withLock {
             try {
-                FileInputStream(targetFile).use { inStream ->
-                    val verifiedBytes = vaultCipher.decryptToByteArray(inStream)
-                    if (verifiedBytes.isEmpty()) {
-                        throw IllegalStateException("Destination payload is empty after encryption")
+                val id = UUID.randomUUID().toString()
+                val encFileName = "$id.enc"
+                val targetFile = File(vaultDir, encFileName)
+
+                val openStream = context.contentResolver.openInputStream(uri)
+                    ?: return@withContext Result.failure(Exception("Cannot open stream for URI $uri"))
+
+                openStream.use { inputStream ->
+                    FileOutputStream(targetFile).use { outStream ->
+                        vaultCipher.encryptStream(inputStream, outStream)
                     }
                 }
-            } catch (e: Exception) {
-                targetFile.delete()
-                return@withContext Result.failure(Exception("Readback cryptographic verification failed", e))
-            }
 
-            val itemType = when {
-                mimeType.startsWith("image/") -> VaultItemType.IMAGE
-                mimeType.startsWith("video/") -> VaultItemType.VIDEO
-                else -> VaultItemType.DOCUMENT
-            }
-
-            val item = VaultMediaItem(
-                id = id,
-                title = originalName,
-                fileName = encFileName,
-                itemType = itemType,
-                fileSize = targetFile.length(),
-                timestamp = System.currentTimeMillis(),
-                mimeType = mimeType
-            )
-
-            // P0.07 fix: Commit item into vault index BEFORE any source deletion attempt
-            val updated = _vaultItems.value.toMutableList()
-            updated.add(0, item)
-            _vaultItems.value = updated
-            saveVaultIndex()
-
-            var sourceDeleted = false
-            var pendingIntentSender: IntentSender? = null
-
-            // If MOVE mode, request OS-level deletion
-            if (mode == ImportMode.MOVE) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && uri.authority == MediaStore.AUTHORITY) {
-                    try {
-                        val pendingDelete = MediaStore.createDeleteRequest(context.contentResolver, listOf(uri))
-                        pendingIntentSender = pendingDelete.intentSender
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Could not create MediaStore delete request", e)
+                // Streaming Readback verification: verify AEAD tags without loading into RAM
+                try {
+                    FileInputStream(targetFile).use { inStream ->
+                        vaultCipher.verifyStreamIntegrity(inStream)
                     }
-                } else {
-                    // Try SAF or ContentResolver direct delete
-                    try {
-                        if (DocumentsContract.isDocumentUri(context, uri)) {
-                            sourceDeleted = DocumentsContract.deleteDocument(context.contentResolver, uri)
-                        } else {
-                            val rows = context.contentResolver.delete(uri, null, null)
-                            sourceDeleted = rows > 0
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Direct content delete failed (needs user consent): ${e.message}")
-                        sourceDeleted = false
-                    }
+                } catch (e: Exception) {
+                    targetFile.delete()
+                    return@withContext Result.failure(Exception("Readback cryptographic verification failed", e))
                 }
-            }
 
-            Result.success(
-                SafeImportResult(
-                    item = item,
-                    mode = mode,
-                    sourceDeleted = sourceDeleted,
-                    pendingDeleteIntentSender = pendingIntentSender,
-                    originalUri = uri
+                val itemType = when {
+                    mimeType.startsWith("image/") -> VaultItemType.IMAGE
+                    mimeType.startsWith("video/") -> VaultItemType.VIDEO
+                    else -> VaultItemType.DOCUMENT
+                }
+
+                val item = VaultMediaItem(
+                    id = id,
+                    title = originalName,
+                    fileName = encFileName,
+                    itemType = itemType,
+                    fileSize = targetFile.length(),
+                    timestamp = System.currentTimeMillis(),
+                    mimeType = mimeType
                 )
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during safe import", e)
-            Result.failure(e)
+
+                // Atomic commit to vault index
+                val updated = _vaultItems.value.toMutableList()
+                updated.add(0, item)
+                _vaultItems.value = updated
+                saveVaultIndex()
+
+                var sourceDeleted = false
+                var pendingIntentSender: IntentSender? = null
+
+                if (mode == ImportMode.MOVE) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && uri.authority == MediaStore.AUTHORITY) {
+                        try {
+                            val uris = listOf(uri)
+                            val deleteRequest = MediaStore.createDeleteRequest(context.contentResolver, uris)
+                            pendingIntentSender = deleteRequest.intentSender
+                        } catch (e: Exception) {
+                            Log.w(TAG, "MediaStore createDeleteRequest failed: ${e.message}")
+                            try {
+                                val count = context.contentResolver.delete(uri, null, null)
+                                sourceDeleted = count > 0
+                            } catch (sec: Exception) {
+                                Log.w(TAG, "Direct delete on MediaStore denied: ${sec.message}")
+                            }
+                        }
+                    } else {
+                        try {
+                            if (DocumentsContract.isDocumentUri(context, uri)) {
+                                sourceDeleted = DocumentsContract.deleteDocument(context.contentResolver, uri)
+                            } else {
+                                val count = context.contentResolver.delete(uri, null, null)
+                                sourceDeleted = count > 0
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to delete original file at $uri: ${e.message}")
+                            sourceDeleted = false
+                        }
+                    }
+                }
+
+                Result.success(
+                    SafeImportResult(
+                        item = item,
+                        mode = mode,
+                        sourceDeleted = sourceDeleted,
+                        pendingDeleteIntentSender = pendingIntentSender,
+                        originalUri = uri
+                    )
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Error importing file safely", e)
+                Result.failure(e)
+            }
         }
     }
 
     /**
-     * Stores a direct camera capture into the encrypted vault without MediaStore trace.
+     * Ingests bytes directly from Secure Camera into hardware-encrypted storage.
      */
-    suspend fun saveEncryptedPhoto(jpegBytes: ByteArray): Result<VaultMediaItem> = withContext(Dispatchers.IO) {
-        try {
-            val id = UUID.randomUUID().toString()
-            val encFileName = "IMG_$id.enc"
-            val targetFile = File(vaultDir, encFileName)
+    suspend fun saveEncryptedPhoto(bytes: ByteArray): Result<VaultMediaItem> {
+        return ingestCameraBytes(
+            bytes = bytes,
+            title = "Ảnh chụp an toàn ${System.currentTimeMillis()}",
+            mimeType = "image/jpeg"
+        )
+    }
 
-            val encryptedBytes = vaultCipher.encrypt(jpegBytes)
-            targetFile.writeBytes(encryptedBytes)
+    suspend fun ingestCameraBytes(
+        bytes: ByteArray,
+        title: String,
+        mimeType: String
+    ): Result<VaultMediaItem> = withContext(Dispatchers.IO) {
+        vaultMutex.withLock {
+            try {
+                val id = UUID.randomUUID().toString()
+                val encFileName = "CAM_$id.enc"
+                val targetFile = File(vaultDir, encFileName)
 
-            val item = VaultMediaItem(
-                id = id,
-                title = "Ảnh bảo mật ${System.currentTimeMillis() % 10000}",
-                fileName = encFileName,
-                itemType = VaultItemType.IMAGE,
-                fileSize = targetFile.length(),
-                timestamp = System.currentTimeMillis(),
-                mimeType = "image/jpeg"
-            )
+                val encrypted = vaultCipher.encrypt(bytes)
+                targetFile.writeBytes(encrypted)
 
-            val updated = _vaultItems.value.toMutableList()
-            updated.add(0, item)
-            _vaultItems.value = updated
-            saveVaultIndex()
+                val item = VaultMediaItem(
+                    id = id,
+                    title = title,
+                    fileName = encFileName,
+                    itemType = if (mimeType.startsWith("video/")) VaultItemType.VIDEO else VaultItemType.IMAGE,
+                    fileSize = targetFile.length(),
+                    timestamp = System.currentTimeMillis(),
+                    mimeType = mimeType
+                )
 
-            Result.success(item)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to save encrypted photo", e)
-            Result.failure(e)
+                val updated = _vaultItems.value.toMutableList()
+                updated.add(0, item)
+                _vaultItems.value = updated
+                saveVaultIndex()
+
+                Result.success(item)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error ingesting camera bytes", e)
+                Result.failure(e)
+            }
         }
     }
 
     /**
-     * Atomic Upsert for Secure Notes:
-     * Saves new encrypted note file and verifies write before updating index.
+     * Saves or updates a secure text note with atomic file write and integrity check.
      */
     suspend fun saveSecureNoteAtomic(
         existingId: String?,
         title: String,
         content: String
     ): Result<VaultMediaItem> = withContext(Dispatchers.IO) {
-        try {
-            val id = existingId ?: UUID.randomUUID().toString()
-            val encFileName = "NOTE_$id.enc"
-            val tempFile = File(vaultDir, "$encFileName.tmp")
+        vaultMutex.withLock {
+            try {
+                val id = existingId ?: UUID.randomUUID().toString()
+                val encFileName = "NOTE_$id.enc"
+                val tempFile = File(vaultDir, "$encFileName.tmp")
 
-            val encryptedBytes = vaultCipher.encrypt(content.toByteArray(Charsets.UTF_8))
-            tempFile.writeBytes(encryptedBytes)
+                val encryptedBytes = vaultCipher.encrypt(content.toByteArray(Charsets.UTF_8))
+                tempFile.writeBytes(encryptedBytes)
 
-            // Verify readback
-            val testRead = vaultCipher.decrypt(tempFile.readBytes())
-            if (String(testRead, Charsets.UTF_8) != content) {
-                tempFile.delete()
-                return@withContext Result.failure(IllegalStateException("Note verification mismatch"))
+                val testRead = vaultCipher.decrypt(tempFile.readBytes())
+                if (String(testRead, Charsets.UTF_8) != content) {
+                    tempFile.delete()
+                    return@withContext Result.failure(IllegalStateException("Note verification mismatch"))
+                }
+
+                val targetFile = File(vaultDir, encFileName)
+                val renamed = tempFile.renameTo(targetFile)
+                if (!renamed) {
+                    tempFile.delete()
+                    return@withContext Result.failure(IOException("Failed to atomically rename note temp file to target"))
+                }
+
+                val item = VaultMediaItem(
+                    id = id,
+                    title = title.ifBlank { "Ghi chú không tên" },
+                    fileName = encFileName,
+                    itemType = VaultItemType.NOTE,
+                    fileSize = targetFile.length(),
+                    timestamp = System.currentTimeMillis(),
+                    mimeType = "text/plain",
+                    noteContent = content
+                )
+
+                val updated = _vaultItems.value.filter { it.id != id }.toMutableList()
+                updated.add(0, item)
+                _vaultItems.value = updated
+                saveVaultIndex()
+
+                Result.success(item)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to save secure note atomically", e)
+                Result.failure(e)
             }
-
-            val targetFile = File(vaultDir, encFileName)
-            tempFile.renameTo(targetFile)
-
-            val item = VaultMediaItem(
-                id = id,
-                title = title.ifBlank { "Ghi chú không tên" },
-                fileName = encFileName,
-                itemType = VaultItemType.NOTE,
-                fileSize = targetFile.length(),
-                timestamp = System.currentTimeMillis(),
-                mimeType = "text/plain",
-                noteContent = content
-            )
-
-            val updated = _vaultItems.value.filter { it.id != id }.toMutableList()
-            updated.add(0, item)
-            _vaultItems.value = updated
-            saveVaultIndex()
-
-            Result.success(item)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to save secure note atomically", e)
-            Result.failure(e)
         }
     }
 
@@ -363,67 +398,88 @@ class VaultRepository(
     }
 
     /**
-     * Secure Wipe (P1.10 fix):
-     * Overwrites entire file length with cryptographic random bytes before deletion.
+     * Secure Wipe:
+     * Overwrites 100% of the entire file length with cryptographic random bytes before deletion.
      */
     suspend fun securelyDeleteItem(item: VaultMediaItem): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val file = File(vaultDir, item.fileName)
-            if (file.exists()) {
-                val totalLength = file.length()
-                if (totalLength > 0) {
-                    val buffer = ByteArray(8192)
-                    val random = SecureRandom()
-                    var remaining = totalLength
-                    FileOutputStream(file).use { out ->
-                        while (remaining > 0) {
-                            val toWrite = minOf(remaining, buffer.size.toLong()).toInt()
-                            random.nextBytes(buffer)
-                            out.write(buffer, 0, toWrite)
-                            remaining -= toWrite
+        vaultMutex.withLock {
+            try {
+                val file = File(vaultDir, item.fileName)
+                if (file.exists()) {
+                    val totalLength = file.length()
+                    if (totalLength > 0) {
+                        val buffer = ByteArray(64 * 1024)
+                        val random = SecureRandom()
+                        var remaining = totalLength
+                        FileOutputStream(file).use { out ->
+                            while (remaining > 0) {
+                                val toWrite = minOf(remaining, buffer.size.toLong()).toInt()
+                                random.nextBytes(buffer)
+                                out.write(buffer, 0, toWrite)
+                                remaining -= toWrite
+                            }
+                            out.flush()
+                            out.fd.sync()
                         }
-                        out.flush()
+                    }
+                    val deleted = file.delete()
+                    if (!deleted && file.exists()) {
+                        Log.w(TAG, "File delete returned false: ${file.name}")
                     }
                 }
-                file.delete()
+                val updated = _vaultItems.value.filter { it.id != item.id }
+                _vaultItems.value = updated
+                saveVaultIndex()
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to securely wipe item ${item.id}", e)
+                false
             }
-            val updated = _vaultItems.value.filter { it.id != item.id }
-            _vaultItems.value = updated
-            saveVaultIndex()
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to securely wipe item ${item.id}", e)
-            false
         }
     }
 
     /**
-     * Real Vault Data Wipe (P0.06 fix):
-     * Completely wipes all encrypted files from internal storage.
+     * Complete Vault Data Wipe:
+     * Overwrites 100% of all bytes of every file in the vault with random data, syncs, and deletes.
      */
     suspend fun wipeAllVaultData(): Boolean = withContext(Dispatchers.IO) {
-        try {
-            vaultDir.listFiles()?.forEach { file ->
-                if (file.isFile) {
-                    try {
-                        val total = file.length()
-                        if (total > 0) {
-                            FileOutputStream(file).use { out ->
-                                out.write(ByteArray(minOf(total.toInt(), 4096)))
-                                out.flush()
+        vaultMutex.withLock {
+            try {
+                val files = vaultDir.listFiles() ?: emptyArray()
+                val random = SecureRandom()
+                val buffer = ByteArray(64 * 1024)
+
+                for (file in files) {
+                    if (file.isFile) {
+                        try {
+                            val total = file.length()
+                            if (total > 0) {
+                                var remaining = total
+                                FileOutputStream(file).use { out ->
+                                    while (remaining > 0) {
+                                        val toWrite = minOf(remaining, buffer.size.toLong()).toInt()
+                                        random.nextBytes(buffer)
+                                        out.write(buffer, 0, toWrite)
+                                        remaining -= toWrite
+                                    }
+                                    out.flush()
+                                    out.fd.sync()
+                                }
                             }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Error wiping content of ${file.name}: ${e.message}")
                         }
-                    } catch (e: Exception) {
-                        // ignore wipe error, proceed with delete
+                        file.delete()
                     }
-                    file.delete()
                 }
+
+                atomicIndexFile.delete()
+                _vaultItems.value = emptyList()
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during complete vault wipe", e)
+                false
             }
-            _vaultItems.value = emptyList()
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during complete vault wipe", e)
-            false
         }
     }
 }

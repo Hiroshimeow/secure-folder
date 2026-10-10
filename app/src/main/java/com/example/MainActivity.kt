@@ -26,6 +26,12 @@ import com.example.viewmodel.FolderHomeViewModel
 import com.example.viewmodel.LockViewModel
 import com.example.viewmodel.VaultViewModel
 
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
 sealed class Screen {
     data object Home : Screen()
     data class Vault(val filterType: String? = null) : Screen()
@@ -37,6 +43,7 @@ class MainActivity : FragmentActivity() {
 
     private lateinit var lockViewModel: LockViewModel
     private var lastBackgroundTimestamp: Long = 0L
+    private var backgroundLockJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -114,6 +121,12 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        backgroundLockJob?.cancel()
+        backgroundLockJob = null
+    }
+
     override fun onResume() {
         super.onResume()
         // P1.04: Check timeout auto-lock policy when returning to foreground
@@ -132,11 +145,20 @@ class MainActivity : FragmentActivity() {
     override fun onStop() {
         super.onStop()
         lastBackgroundTimestamp = System.currentTimeMillis()
-        // P1.04: If auto-lock is immediate (0 mins), lock immediately upon leaving
         val settings = SecureFolderApp.instance.settingsRepository.settings.value
         if (settings.autoLockTimeoutMinutes == 0) {
             if (::lockViewModel.isInitialized) {
                 lockViewModel.lockVault()
+            }
+        } else if (settings.autoLockTimeoutMinutes > 0) {
+            // Proactively expire session in background when timer expires
+            backgroundLockJob?.cancel()
+            val delayMillis = settings.autoLockTimeoutMinutes * 60 * 1000L
+            backgroundLockJob = lifecycleScope.launch(Dispatchers.Default) {
+                delay(delayMillis)
+                SecureFolderApp.instance.sessionManager.invalidateSession()
+                SecureFolderApp.instance.profileManager.setProfileLocked(true)
+                SecureFolderApp.instance.settingsRepository.setLocked(true)
             }
         }
     }

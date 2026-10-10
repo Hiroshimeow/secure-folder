@@ -212,10 +212,12 @@ class VaultViewModel : ViewModel() {
 
     fun deleteItem(item: VaultMediaItem) {
         viewModelScope.launch {
-            vaultRepository.securelyDeleteItem(item)
+            val success = vaultRepository.securelyDeleteItem(item)
             closeViewer()
             closeNoteEditor()
-            _uiState.value = _uiState.value.copy(message = "Đã ghi đè toàn bộ tệp và xóa an toàn")
+            _uiState.value = _uiState.value.copy(
+                message = if (success) "Đã ghi đè toàn bộ tệp và xóa an toàn" else "Lỗi: Không thể xóa an toàn tệp tin"
+            )
         }
     }
 

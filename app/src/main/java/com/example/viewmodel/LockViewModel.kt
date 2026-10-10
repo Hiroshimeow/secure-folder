@@ -87,11 +87,10 @@ class LockViewModel : ViewModel() {
 
             // If in initial setup flow
             if (!_uiState.value.isPinSetup) {
-                // User enters digits in setup phase
                 return
             }
 
-            // Normal Unlock Flow: when 4 or more digits entered, try verify
+            // Normal Unlock Flow:
             if (updated.length >= 4) {
                 if (settingsRepository.verifyPin(updated)) {
                     _uiState.value = _uiState.value.copy(failedAttempts = 0)
@@ -145,15 +144,44 @@ class LockViewModel : ViewModel() {
         }
     }
 
+    fun onPinDelete() {
+        val current = _uiState.value.pinInput
+        // If user already typed >= 4 digits (a full candidate PIN that failed to unlock) and is deleting,
+        // treat this abandoned incorrect sequence as a failed attempt to prevent silent brute-forcing!
+        if (_uiState.value.isPinSetup && current.length >= 4) {
+            handleFailedAttempt()
+            return
+        }
+        if (current.isNotEmpty()) {
+            _uiState.value = _uiState.value.copy(pinInput = current.dropLast(1), errorMessage = null)
+        }
+    }
+
+    fun onPinClear() {
+        val current = _uiState.value.pinInput
+        if (_uiState.value.isPinSetup && current.length >= 4) {
+            handleFailedAttempt()
+            return
+        }
+        _uiState.value = _uiState.value.copy(pinInput = "", errorMessage = null)
+    }
+
     private fun handleFailedAttempt() {
         val newFailed = _uiState.value.failedAttempts + 1
-        if (newFailed >= 5) {
-            lockoutUntilMillis = System.currentTimeMillis() + 30_000L
+        val lockoutSeconds = when {
+            newFailed >= 15 -> 300
+            newFailed >= 10 -> 60
+            newFailed >= 5 -> 30
+            else -> 0
+        }
+
+        if (lockoutSeconds > 0) {
+            lockoutUntilMillis = System.currentTimeMillis() + (lockoutSeconds * 1000L)
             _uiState.value = _uiState.value.copy(
                 pinInput = "",
-                failedAttempts = 0,
-                lockoutRemainingSeconds = 30,
-                errorMessage = "Nhập sai 5 lần. Tạm khóa trong 30 giây."
+                failedAttempts = newFailed,
+                lockoutRemainingSeconds = lockoutSeconds,
+                errorMessage = "Nhập sai $newFailed lần. Tạm khóa trong ${lockoutSeconds}s."
             )
         } else {
             _uiState.value = _uiState.value.copy(
@@ -162,17 +190,6 @@ class LockViewModel : ViewModel() {
                 errorMessage = "Mã PIN không chính xác (Còn ${5 - newFailed} lần thử)."
             )
         }
-    }
-
-    fun onPinDelete() {
-        val current = _uiState.value.pinInput
-        if (current.isNotEmpty()) {
-            _uiState.value = _uiState.value.copy(pinInput = current.dropLast(1), errorMessage = null)
-        }
-    }
-
-    fun onPinClear() {
-        _uiState.value = _uiState.value.copy(pinInput = "", errorMessage = null)
     }
 
     fun unlockVault() {
@@ -219,10 +236,26 @@ class LockViewModel : ViewModel() {
                 _uiState.value = _uiState.value.copy(calculatorDisplay = "0", calculatorExpression = "")
             }
             "=" -> {
+                if (_uiState.value.lockoutRemainingSeconds > 0) {
+                    _uiState.value = _uiState.value.copy(calculatorDisplay = "LOCKED")
+                    return
+                }
+
+                val isPinCandidate = (currentDisplay.length in 4..6 && currentDisplay.all { it.isDigit() }) ||
+                        (currentExpr.trim().length in 4..6 && currentExpr.trim().all { it.isDigit() })
+
                 // Check if the current expression or display is the secret PIN!
                 if (settingsRepository.verifyPin(currentDisplay) || settingsRepository.verifyPin(currentExpr.trim())) {
+                    _uiState.value = _uiState.value.copy(failedAttempts = 0)
                     unlockVault()
                     return
+                } else if (isPinCandidate && _uiState.value.isPinSetup) {
+                    // Candidate PIN attempt failed in calculator mode: track failed attempt
+                    handleFailedAttempt()
+                    if (_uiState.value.lockoutRemainingSeconds > 0) {
+                        _uiState.value = _uiState.value.copy(calculatorDisplay = "LOCKED")
+                        return
+                    }
                 }
                 // Otherwise evaluate math
                 try {

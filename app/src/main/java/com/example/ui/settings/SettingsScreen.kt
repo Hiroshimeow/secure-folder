@@ -347,12 +347,18 @@ fun SettingsScreen(
                 Button(
                     onClick = {
                         scope.launch {
-                            SecureFolderApp.instance.vaultRepository.wipeAllVaultData()
-                            SecureFolderApp.instance.keyStoreManager.deleteKey()
-                            settingsRepo.resetAllSettings()
-                            SecureFolderApp.instance.appRepository.loadClonedApps()
-                            showResetDialog = false
-                            snackbarHostState.showSnackbar("Đã xóa sạch toàn bộ dữ liệu Vault và đặt lại cấu hình")
+                            val wipeSuccess = SecureFolderApp.instance.vaultRepository.wipeAllVaultData()
+                            if (wipeSuccess) {
+                                SecureFolderApp.instance.keyStoreManager.deleteKey()
+                                settingsRepo.resetAllSettings()
+                                SecureFolderApp.instance.sessionManager.invalidateSession()
+                                SecureFolderApp.instance.profileManager.setProfileLocked(true)
+                                SecureFolderApp.instance.appRepository.loadClonedApps()
+                                showResetDialog = false
+                                onBack()
+                            } else {
+                                snackbarHostState.showSnackbar("Cảnh báo: Không thể xóa sạch hoàn toàn các tệp trong Vault")
+                            }
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = OneUiLockRed)
