@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:translateX="0"
+        android:translateY="0">
+        <!-- Secure Folder Body (Squircle Folder Base) -->
+        <path
+            android:fillColor="#00A389"
+            android:pathData="M31,34 C28,34 26,36 26,39 L26,71 C26,76 30,80 35,80 L73,80 C78,80 82,76 82,71 L82,45 C82,40 78,36 73,36 L56,36 L51,32 C49,30 46,30 43,30 L35,30 C32,30 31,32 31,34 Z" />
+        
+        <!-- Inner subtle folder accent -->
+        <path
+            android:fillColor="#15BD9F"
+            android:pathData="M26,45 L82,45 L82,71 C82,76 78,80 73,80 L35,80 C30,80 26,76 26,71 Z" />
+        
+        <!-- Knox Security Shield in Center -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M54,48 L64,52 C64,62 58,68 54,71 C50,68 44,62 44,52 Z" />
+        
+        <!-- Padlock / Keyhole on shield -->
+        <path
+            android:fillColor="#00A389"
+            android:pathData="M54,54 C52.3,54 51,55.3 51,57 C51,58.2 51.7,59.3 52.8,59.7 L52.2,64 L55.8,64 L55.2,59.7 C56.3,59.3 57,58.2 57,57 C57,55.3 55.7,54 54,54 Z" />
+    </group>
+</vector>

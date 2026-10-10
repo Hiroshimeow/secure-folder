@@ -1,0 +1,6 @@
+{
+  "name": "Secure Folder",
+  "description": "Samsung Secure Folder (Thư mục bảo mật) Native Android App with Work Profile isolation, app cloning, KeyStore encryption, camera vault, and disguise.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

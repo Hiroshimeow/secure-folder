@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Secure Folder</string>
+    <string name="app_name_disguised">Máy tính</string>
+    <string name="secure_folder_title">Thư mục Bảo mật</string>
+    <string name="secure_folder_subtitle">Bảo vệ ứng dụng và tệp tin riêng tư của bạn</string>
+    <string name="device_admin_description">Quản lý không gian làm việc an toàn và cấu hình Thư mục Bảo mật Samsung.</string>
+</resources>
