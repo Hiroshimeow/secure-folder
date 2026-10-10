@@ -160,23 +160,26 @@ class AppRepository(
 
     /**
      * Clones an application into the Secure Folder using DPC installExistingPackage.
+     * P0.02 fix: Only records clone if system cloning actually succeeds!
      */
     suspend fun cloneApp(app: ClonedApp): Boolean = withContext(Dispatchers.IO) {
         val success = profileManager.cloneAppIntoSecureFolder(app.packageName)
+        if (success) {
+            val currentSaved = prefs.getStringSet(KEY_CLONED_PACKAGES, emptySet())?.toMutableSet() ?: mutableSetOf()
+            currentSaved.add(app.packageName)
+            prefs.edit().putStringSet(KEY_CLONED_PACKAGES, currentSaved).apply()
 
-        val currentSaved = prefs.getStringSet(KEY_CLONED_PACKAGES, emptySet())?.toMutableSet() ?: mutableSetOf()
-        currentSaved.add(app.packageName)
-        prefs.edit().putStringSet(KEY_CLONED_PACKAGES, currentSaved).apply()
-
-        loadClonedApps()
-        refreshHostApps()
+            loadClonedApps()
+            refreshHostApps()
+        }
         success
     }
 
     /**
-     * Removes a cloned app from the Secure Folder.
+     * Removes a cloned app from the Secure Folder (P1.02 fix: hides/uninstalls from profile).
      */
     suspend fun removeClonedApp(packageName: String) = withContext(Dispatchers.IO) {
+        profileManager.uncloneApp(packageName)
         val currentSaved = prefs.getStringSet(KEY_CLONED_PACKAGES, emptySet())?.toMutableSet() ?: mutableSetOf()
         currentSaved.remove(packageName)
         prefs.edit().putStringSet(KEY_CLONED_PACKAGES, currentSaved).apply()

@@ -1,6 +1,7 @@
 package com.example
 
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.Crossfade
@@ -35,9 +36,16 @@ sealed class Screen {
 class MainActivity : FragmentActivity() {
 
     private lateinit var lockViewModel: LockViewModel
+    private var lastBackgroundTimestamp: Long = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // P1.06: Enforce FLAG_SECURE to prevent screenshots, screen recording, and task switcher leaks
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_SECURE,
+            WindowManager.LayoutParams.FLAG_SECURE
+        )
+
         enableEdgeToEdge()
 
         setContent {
@@ -106,9 +114,25 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // P1.04: Check timeout auto-lock policy when returning to foreground
+        val settings = SecureFolderApp.instance.settingsRepository.settings.value
+        if (settings.autoLockTimeoutMinutes > 0 && lastBackgroundTimestamp > 0L) {
+            val elapsedMillis = System.currentTimeMillis() - lastBackgroundTimestamp
+            val thresholdMillis = settings.autoLockTimeoutMinutes * 60 * 1000L
+            if (elapsedMillis >= thresholdMillis) {
+                if (::lockViewModel.isInitialized) {
+                    lockViewModel.lockVault()
+                }
+            }
+        }
+    }
+
     override fun onStop() {
         super.onStop()
-        // Samsung Secure Folder auto-lock policy on exit
+        lastBackgroundTimestamp = System.currentTimeMillis()
+        // P1.04: If auto-lock is immediate (0 mins), lock immediately upon leaving
         val settings = SecureFolderApp.instance.settingsRepository.settings.value
         if (settings.autoLockTimeoutMinutes == 0) {
             if (::lockViewModel.isInitialized) {

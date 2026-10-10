@@ -544,7 +544,7 @@ private fun WorkProfileStatusCard(
                 )
                 Spacer(modifier = Modifier.width(10.dp))
                 Text(
-                    text = if (state.isProfileOwner) "Chế độ Knox Tách biệt Đang Hoạt Động" else "Bảo vệ Không gian Riêng tư",
+                    text = if (state.isProfileOwner) "Hồ sơ Cách ly Android Enterprise (DPC)" else "Không gian Ứng dụng Riêng tư",
                     style = MaterialTheme.typography.titleMedium.copy(
                         fontWeight = FontWeight.Bold,
                         color = OneUiDarkTextPrimary,
@@ -557,9 +557,9 @@ private fun WorkProfileStatusCard(
 
             Text(
                 text = if (state.isProfileOwner) {
-                    "Các ứng dụng và dữ liệu bên trong được mã hóa phần cứng TEE và cách ly hoàn toàn khỏi người dùng cá nhân."
+                    "Chế độ Profile Owner hoạt động. Ứng dụng nhân bản được cô lập hoàn toàn trong User ID riêng và đóng băng khi khóa."
                 } else {
-                    "Mã hóa phần cứng AES-256-GCM hoạt động. Để cô lập tài khoản ứng dụng (Zalo, Facebook song song), hãy kích hoạt Work Profile DPC."
+                    "Mã hóa phần cứng AES-256-GCM hoạt động cho Vault. Để nhân bản và cách ly ứng dụng (Zalo, Telegram, Facebook), cần cấp quyền Profile Owner (Hồ sơ Công việc)."
                 },
                 style = MaterialTheme.typography.bodySmall.copy(
                     color = OneUiDarkTextSecondary,

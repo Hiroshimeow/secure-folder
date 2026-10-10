@@ -7,20 +7,31 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.SecureFolderApp
-import com.example.data.model.SecureVaultSettings
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
+enum class PinSetupPhase {
+    NOT_IN_SETUP,
+    ENTER_NEW_PIN,
+    CONFIRM_NEW_PIN
+}
+
 data class LockUiState(
     val isLocked: Boolean = true,
+    val isPinSetup: Boolean = false,
     val isDisguised: Boolean = false,
+    val pinSetupPhase: PinSetupPhase = PinSetupPhase.NOT_IN_SETUP,
     val pinInput: String = "",
+    val firstEnteredPin: String = "",
     val errorMessage: String? = null,
     val calculatorDisplay: String = "0",
     val calculatorExpression: String = "",
-    val biometricAvailable: Boolean = false
+    val failedAttempts: Int = 0,
+    val lockoutRemainingSeconds: Int = 0,
+    val useBiometrics: Boolean = true
 )
 
 class LockViewModel : ViewModel() {
@@ -31,38 +42,125 @@ class LockViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(LockUiState())
     val uiState: StateFlow<LockUiState> = _uiState.asStateFlow()
 
+    private var lockoutUntilMillis: Long = 0L
+
     init {
         viewModelScope.launch {
             settingsRepository.settings.collect { settings ->
+                val isSetup = settings.isPinSetup
                 _uiState.value = _uiState.value.copy(
                     isLocked = settings.isLocked,
-                    isDisguised = settings.isDisguisedAsCalculator
+                    isPinSetup = isSetup,
+                    isDisguised = settings.isDisguisedAsCalculator,
+                    useBiometrics = settings.useBiometrics,
+                    pinSetupPhase = if (!isSetup) PinSetupPhase.ENTER_NEW_PIN else PinSetupPhase.NOT_IN_SETUP
                 )
+            }
+        }
+
+        // Lockout countdown timer
+        viewModelScope.launch {
+            while (true) {
+                delay(1000)
+                val remaining = ((lockoutUntilMillis - System.currentTimeMillis()) / 1000).toInt()
+                if (remaining > 0) {
+                    _uiState.value = _uiState.value.copy(lockoutRemainingSeconds = remaining)
+                } else if (_uiState.value.lockoutRemainingSeconds > 0) {
+                    _uiState.value = _uiState.value.copy(lockoutRemainingSeconds = 0, errorMessage = null)
+                }
             }
         }
     }
 
     fun onPinDigit(digit: String) {
+        if (_uiState.value.lockoutRemainingSeconds > 0) {
+            _uiState.value = _uiState.value.copy(
+                errorMessage = "Tạm khóa do nhập sai nhiều lần. Vui lòng đợi ${_uiState.value.lockoutRemainingSeconds}s."
+            )
+            return
+        }
+
         val current = _uiState.value.pinInput
         if (current.length < 6) {
             val updated = current + digit
             _uiState.value = _uiState.value.copy(pinInput = updated, errorMessage = null)
+
+            // If in initial setup flow
+            if (!_uiState.value.isPinSetup) {
+                // User enters digits in setup phase
+                return
+            }
+
+            // Normal Unlock Flow: when 4 or more digits entered, try verify
             if (updated.length >= 4) {
-                // Check if PIN matches
                 if (settingsRepository.verifyPin(updated)) {
+                    _uiState.value = _uiState.value.copy(failedAttempts = 0)
                     unlockVault()
-                } else if (updated.length == 4 && !settingsRepository.verifyPin(updated)) {
-                    // Let user finish or if 4 digits mismatch:
-                    // If pin length is 4 in settings, show error after short check
-                    val expectedLen = settingsRepository.settings.value.pinCode.length
-                    if (updated.length == expectedLen) {
-                        _uiState.value = _uiState.value.copy(
-                            pinInput = "",
-                            errorMessage = "Mã PIN không chính xác. Vui lòng thử lại."
-                        )
-                    }
+                } else if (updated.length == 6) {
+                    // Maximum 6 digits reached and incorrect
+                    handleFailedAttempt()
                 }
             }
+        }
+    }
+
+    fun submitPinSetup() {
+        val input = _uiState.value.pinInput
+        if (input.length < 4) {
+            _uiState.value = _uiState.value.copy(errorMessage = "Mã PIN phải có từ 4 đến 6 chữ số.")
+            return
+        }
+
+        when (_uiState.value.pinSetupPhase) {
+            PinSetupPhase.ENTER_NEW_PIN -> {
+                _uiState.value = _uiState.value.copy(
+                    pinSetupPhase = PinSetupPhase.CONFIRM_NEW_PIN,
+                    firstEnteredPin = input,
+                    pinInput = "",
+                    errorMessage = null
+                )
+            }
+            PinSetupPhase.CONFIRM_NEW_PIN -> {
+                if (input == _uiState.value.firstEnteredPin) {
+                    val success = settingsRepository.setPin(input)
+                    if (success) {
+                        _uiState.value = _uiState.value.copy(
+                            pinSetupPhase = PinSetupPhase.NOT_IN_SETUP,
+                            pinInput = "",
+                            firstEnteredPin = "",
+                            errorMessage = null
+                        )
+                        unlockVault()
+                    }
+                } else {
+                    _uiState.value = _uiState.value.copy(
+                        pinSetupPhase = PinSetupPhase.ENTER_NEW_PIN,
+                        pinInput = "",
+                        firstEnteredPin = "",
+                        errorMessage = "Mã xác nhận không khớp. Vui lòng thiết lập lại từ đầu."
+                    )
+                }
+            }
+            else -> {}
+        }
+    }
+
+    private fun handleFailedAttempt() {
+        val newFailed = _uiState.value.failedAttempts + 1
+        if (newFailed >= 5) {
+            lockoutUntilMillis = System.currentTimeMillis() + 30_000L
+            _uiState.value = _uiState.value.copy(
+                pinInput = "",
+                failedAttempts = 0,
+                lockoutRemainingSeconds = 30,
+                errorMessage = "Nhập sai 5 lần. Tạm khóa trong 30 giây."
+            )
+        } else {
+            _uiState.value = _uiState.value.copy(
+                pinInput = "",
+                failedAttempts = newFailed,
+                errorMessage = "Mã PIN không chính xác (Còn ${5 - newFailed} lần thử)."
+            )
         }
     }
 
@@ -81,7 +179,7 @@ class LockViewModel : ViewModel() {
         viewModelScope.launch {
             // Start fresh authenticated session
             SecureFolderApp.instance.sessionManager.startSession()
-            // Unfreeze Managed Profile and background tasks
+            // Unfreeze profile
             profileManager.setProfileLocked(false)
             settingsRepository.setLocked(false)
             _uiState.value = _uiState.value.copy(
@@ -111,8 +209,6 @@ class LockViewModel : ViewModel() {
 
     /**
      * Calculator disguise logic:
-     * Fully works as a real calculator, but if the secret PIN followed by '=' is entered,
-     * it unlocks the Samsung Secure Folder!
      */
     fun onCalculatorKey(key: String) {
         val currentDisplay = _uiState.value.calculatorDisplay
@@ -124,11 +220,11 @@ class LockViewModel : ViewModel() {
             }
             "=" -> {
                 // Check if the current expression or display is the secret PIN!
-                if (settingsRepository.verifyPin(currentDisplay) || settingsRepository.verifyPin(currentExpr)) {
+                if (settingsRepository.verifyPin(currentDisplay) || settingsRepository.verifyPin(currentExpr.trim())) {
                     unlockVault()
                     return
                 }
-                // Otherwise evaluate simple math
+                // Otherwise evaluate math
                 try {
                     val result = evaluateMath(currentExpr + currentDisplay)
                     _uiState.value = _uiState.value.copy(
@@ -156,7 +252,6 @@ class LockViewModel : ViewModel() {
                 _uiState.value = _uiState.value.copy(calculatorDisplay = (num / 100.0).toString())
             }
             else -> {
-                // Digit or decimal
                 val updated = if (currentDisplay == "0" && key != ".") key else currentDisplay + key
                 _uiState.value = _uiState.value.copy(calculatorDisplay = updated)
             }
@@ -182,9 +277,13 @@ class LockViewModel : ViewModel() {
     }
 
     /**
-     * Prompts Android Biometrics (Strong Class 3 / Fingerprint).
+     * Prompts Android Biometrics only if enabled in Settings (P1.05 fix).
      */
     fun promptBiometrics(activity: FragmentActivity) {
+        if (!_uiState.value.useBiometrics || !_uiState.value.isPinSetup) {
+            return
+        }
+
         val biometricManager = BiometricManager.from(activity)
         val canAuth = biometricManager.canAuthenticate(
             BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL

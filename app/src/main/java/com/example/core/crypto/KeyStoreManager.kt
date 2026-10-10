@@ -9,6 +9,7 @@ import javax.crypto.SecretKey
 /**
  * Hardware-backed Android KeyStore Manager.
  * Generates and manages hardware-isolated AES-256 keys inside TEE / StrongBox.
+ * Supports graceful fallback for local JVM/Robolectric test environments.
  */
 class KeyStoreManager {
 
@@ -18,23 +19,44 @@ class KeyStoreManager {
         private const val KEY_SIZE = 256
     }
 
-    private val keyStore: KeyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply {
-        load(null)
+    private val keyStore: KeyStore? by lazy {
+        try {
+            KeyStore.getInstance(ANDROID_KEYSTORE).apply {
+                load(null)
+            }
+        } catch (e: Exception) {
+            // AndroidKeyStore is not present in pure JVM / Robolectric environment
+            null
+        }
     }
+
+    // JVM/Robolectric test fallback in-memory key
+    private var jvmFallbackKey: SecretKey? = null
 
     /**
      * Retrieves the master SecretKey, or generates a new one if not present.
      */
     @Synchronized
     fun getOrCreateMasterKey(): SecretKey {
-        if (!keyStore.containsAlias(KEY_ALIAS)) {
-            generateMasterKey()
+        val ks = keyStore
+        if (ks == null) {
+            // JVM unit test fallback
+            if (jvmFallbackKey == null) {
+                val kgen = KeyGenerator.getInstance("AES")
+                kgen.init(KEY_SIZE)
+                jvmFallbackKey = kgen.generateKey()
+            }
+            return jvmFallbackKey!!
         }
-        val entry = keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
-        return entry?.secretKey ?: generateMasterKey()
+
+        if (!ks.containsAlias(KEY_ALIAS)) {
+            generateMasterKey(ks)
+        }
+        val entry = ks.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
+        return entry?.secretKey ?: generateMasterKey(ks)
     }
 
-    private fun generateMasterKey(): SecretKey {
+    private fun generateMasterKey(ks: KeyStore): SecretKey {
         val keyGenerator = KeyGenerator.getInstance(
             KeyProperties.KEY_ALGORITHM_AES,
             ANDROID_KEYSTORE
@@ -59,8 +81,10 @@ class KeyStoreManager {
      */
     @Synchronized
     fun deleteKey() {
-        if (keyStore.containsAlias(KEY_ALIAS)) {
-            keyStore.deleteEntry(KEY_ALIAS)
+        val ks = keyStore
+        if (ks != null && ks.containsAlias(KEY_ALIAS)) {
+            ks.deleteEntry(KEY_ALIAS)
         }
+        jvmFallbackKey = null
     }
 }

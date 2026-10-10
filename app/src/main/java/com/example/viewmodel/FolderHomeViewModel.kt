@@ -88,7 +88,11 @@ class FolderHomeViewModel : ViewModel() {
             _uiState.value = _uiState.value.copy(
                 isLoading = false,
                 isAddAppSheetOpen = false,
-                statusMessage = if (success) "Đã thêm ${app.appLabel} vào Thư mục Bảo mật" else "Thêm ${app.appLabel} vào danh sách bảo vệ"
+                statusMessage = if (success) {
+                    "Đã nhân bản ${app.appLabel} vào hồ sơ bảo mật thành công"
+                } else {
+                    "Không thể nhân bản: Chưa kích hoạt Profile Owner (Android Enterprise Work Profile)"
+                }
             )
         }
     }

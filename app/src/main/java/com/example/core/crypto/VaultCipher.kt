@@ -1,8 +1,8 @@
 package com.example.core.crypto
 
+import com.example.SecureFolderApp
 import java.io.InputStream
 import java.io.OutputStream
-import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.CipherInputStream
 import javax.crypto.CipherOutputStream
@@ -11,6 +11,7 @@ import javax.crypto.spec.GCMParameterSpec
 /**
  * High-performance AES-256-GCM authenticated cipher for Vault storage.
  * Ensures confidentiality and tamper-evident authentication tags.
+ * P0.08 fix: Strictly gates cryptographic operations behind Session Authorization.
  */
 class VaultCipher(private val keyStoreManager: KeyStoreManager) {
 
@@ -20,10 +21,18 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
         private const val GCM_TAG_LENGTH = 128 // 128-bit authentication tag
     }
 
+    private fun assertAuthorized() {
+        val sessionMgr = SecureFolderApp.instance.sessionManager
+        if (!sessionMgr.isAuthenticated.value) {
+            throw SecurityException("Cryptographic access denied: Vault session is locked or unauthenticated")
+        }
+    }
+
     /**
      * Encrypts byte array and outputs [12-byte IV + ciphertext + tag].
      */
     fun encrypt(plainBytes: ByteArray): ByteArray {
+        assertAuthorized()
         val secretKey = keyStoreManager.getOrCreateMasterKey()
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, secretKey)
@@ -40,6 +49,7 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
      * Decrypts byte array from [12-byte IV + ciphertext + tag].
      */
     fun decrypt(encryptedBytes: ByteArray): ByteArray {
+        assertAuthorized()
         if (encryptedBytes.size < GCM_IV_LENGTH) {
             throw IllegalArgumentException("Invalid encrypted payload: size too small")
         }
@@ -63,6 +73,7 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
      * Writes 12-byte IV first, then cipher stream.
      */
     fun encryptStream(input: InputStream, output: OutputStream) {
+        assertAuthorized()
         val secretKey = keyStoreManager.getOrCreateMasterKey()
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, secretKey)
@@ -78,6 +89,7 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
      * Streams encrypted input from disk and writes decrypted bytes to output.
      */
     fun decryptStream(input: InputStream, output: OutputStream) {
+        assertAuthorized()
         val iv = ByteArray(GCM_IV_LENGTH)
         val bytesRead = input.read(iv)
         if (bytesRead != GCM_IV_LENGTH) {
@@ -98,6 +110,7 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
      * Convenience method to decrypt stream into memory byte array.
      */
     fun decryptToByteArray(input: InputStream): ByteArray {
+        assertAuthorized()
         val byteOut = java.io.ByteArrayOutputStream()
         decryptStream(input, byteOut)
         return byteOut.toByteArray()

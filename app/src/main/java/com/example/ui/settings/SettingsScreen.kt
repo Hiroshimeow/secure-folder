@@ -268,7 +268,7 @@ fun SettingsScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     OutlinedTextField(
                         value = newPin,
-                        onValueChange = { if (it.length <= 6) newPin = it },
+                        onValueChange = { if (it.length <= 6 && it.all { ch -> ch.isDigit() }) newPin = it },
                         label = { Text("Mã PIN mới (4-6 số)", color = OneUiDarkTextSecondary) },
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
@@ -280,7 +280,7 @@ fun SettingsScreen(
                     )
                     OutlinedTextField(
                         value = confirmPin,
-                        onValueChange = { if (it.length <= 6) confirmPin = it },
+                        onValueChange = { if (it.length <= 6 && it.all { ch -> ch.isDigit() }) confirmPin = it },
                         label = { Text("Xác nhận mã PIN mới", color = OneUiDarkTextSecondary) },
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
@@ -298,15 +298,17 @@ fun SettingsScreen(
             confirmButton = {
                 Button(
                     onClick = {
-                        if (newPin.length < 4) {
-                            pinError = "Mã PIN phải có ít nhất 4 chữ số."
+                        if (newPin.length !in 4..6 || !newPin.all { it.isDigit() }) {
+                            pinError = "Mã PIN phải từ 4 đến 6 chữ số (chỉ ký tự số)."
                         } else if (newPin != confirmPin) {
                             pinError = "Mã PIN xác nhận không trùng khớp."
                         } else {
-                            settingsRepo.setPin(newPin)
-                            showChangePinDialog = false
-                            scope.launch {
-                                snackbarHostState.showSnackbar("Đã đổi mã PIN thành công")
+                            val success = settingsRepo.setPin(newPin)
+                            if (success) {
+                                showChangePinDialog = false
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Đã đổi mã PIN thành công")
+                                }
                             }
                         }
                     },
@@ -323,7 +325,7 @@ fun SettingsScreen(
         )
     }
 
-    // Reset Secure Folder Dialog
+    // Reset Secure Folder Dialog (P0.06 fix: Real wipe of files and keys)
     if (showResetDialog) {
         AlertDialog(
             onDismissRequest = { showResetDialog = false },
@@ -337,23 +339,25 @@ fun SettingsScreen(
             },
             text = {
                 Text(
-                    text = "Hành động này sẽ xóa vĩnh viễn tất cả tệp tin, ảnh chụp an toàn và ghi chú bên trong vault. Dữ liệu không thể khôi phục.",
+                    text = "Hành động này sẽ xóa vĩnh viễn tất cả tệp tin, ảnh chụp an toàn, ghi chú bên trong vault và xóa khóa phần cứng KeyStore. Dữ liệu không thể khôi phục.",
                     color = OneUiDarkTextSecondary
                 )
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        settingsRepo.setPin("1234")
-                        settingsRepo.setDisguisedAsCalculator(false)
-                        showResetDialog = false
                         scope.launch {
-                            snackbarHostState.showSnackbar("Đã đặt lại cấu hình Thư mục Bảo mật")
+                            SecureFolderApp.instance.vaultRepository.wipeAllVaultData()
+                            SecureFolderApp.instance.keyStoreManager.deleteKey()
+                            settingsRepo.resetAllSettings()
+                            SecureFolderApp.instance.appRepository.loadClonedApps()
+                            showResetDialog = false
+                            snackbarHostState.showSnackbar("Đã xóa sạch toàn bộ dữ liệu Vault và đặt lại cấu hình")
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = OneUiLockRed)
                 ) {
-                    Text("Xóa dữ liệu", color = Color.White)
+                    Text("Xóa vĩnh viễn dữ liệu", color = Color.White)
                 }
             },
             dismissButton = {

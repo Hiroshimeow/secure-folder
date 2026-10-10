@@ -76,6 +76,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -461,10 +462,45 @@ fun VaultGalleryScreen(
                                     modifier = Modifier.fillMaxSize()
                                 )
                             } else {
-                                Text(
-                                    text = "Đã giải mã tập tin (${item.fileSize / 1024} KB)",
-                                    color = Color.White
-                                )
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    modifier = Modifier
+                                        .padding(24.dp)
+                                        .clip(RoundedCornerShape(20.dp))
+                                        .background(OneUiDarkCard)
+                                        .padding(24.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (item.itemType == VaultItemType.VIDEO) Icons.Default.VideoLibrary else Icons.Default.Description,
+                                        contentDescription = null,
+                                        tint = if (item.itemType == VaultItemType.VIDEO) OneUiLockRed else Color(0xFF9B51E0),
+                                        modifier = Modifier.size(64.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                    Text(
+                                        text = item.title,
+                                        color = Color.White,
+                                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                        textAlign = TextAlign.Center
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        text = "Loại MIME: ${item.mimeType}",
+                                        color = OneUiDarkTextSecondary,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    Text(
+                                        text = "Kích thước: ${item.fileSize / 1024} KB",
+                                        color = OneUiDarkTextSecondary,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Text(
+                                        text = "✓ Đã xác minh giải mã phần cứng AES-256-GCM an toàn",
+                                        color = OneUiTealBright,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                }
                             }
                         } else {
                             Text("Đang giải mã bằng KeyStore...", color = OneUiTealBright)

@@ -43,11 +43,14 @@ class VaultViewModel : ViewModel() {
             }
         }
 
-        // Observe session authorization: when invalidated (locked), purge all plaintext in RAM
+        // P1.07 & P1.08: Session-bound index loading and RAM purging
         viewModelScope.launch {
             sessionManager.isAuthenticated.collect { authed ->
-                if (!authed) {
+                if (authed) {
+                    vaultRepository.loadVaultIndex()
+                } else {
                     purgePlaintextInMemory()
+                    vaultRepository.clearVaultCacheOnLock()
                 }
             }
         }
@@ -71,20 +74,25 @@ class VaultViewModel : ViewModel() {
      * Executes the Safe Import pipeline (Copy or Move).
      */
     fun importFile(uri: Uri, name: String, mimeType: String, mode: ImportMode) {
+        val currentSessionId = sessionManager.sessionId.value
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true)
             val result = vaultRepository.importFileSafely(uri, name, mimeType, mode)
+
+            if (!sessionManager.isSessionValid(currentSessionId)) {
+                _uiState.value = _uiState.value.copy(isLoading = false)
+                return@launch
+            }
 
             if (result.isSuccess) {
                 val importRes = result.getOrThrow()
                 if (mode == ImportMode.MOVE) {
                     if (importRes.pendingDeleteIntentSender != null) {
-                        // OS consent needed to delete original
                         _uiState.value = _uiState.value.copy(
                             isLoading = false,
                             pendingDeleteIntentSender = importRes.pendingDeleteIntentSender,
                             pendingMoveItemTitle = importRes.item.title,
-                            message = "Đã lưu vào Vault. Vui lòng cho phép xóa file gốc trên thiết bị."
+                            message = "Đã lưu vào Vault. Vui lòng xác nhận xóa tệp gốc trên thiết bị."
                         )
                     } else if (importRes.sourceDeleted) {
                         _uiState.value = _uiState.value.copy(
@@ -120,15 +128,22 @@ class VaultViewModel : ViewModel() {
             message = if (granted) {
                 "Đã xóa bản gốc của $title thành công."
             } else {
-                "Đã lưu $title trong Vault (Bản gốc giữ nguyên do bạn từ chối quyền xóa)."
+                "Đã lưu $title trong Vault (Bản gốc giữ nguyên do từ chối quyền xóa)."
             }
         )
     }
 
     fun saveNoteAtomic(title: String, content: String, existingId: String? = null) {
+        val currentSessionId = sessionManager.sessionId.value
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true)
             val result = vaultRepository.saveSecureNoteAtomic(existingId, title, content)
+
+            if (!sessionManager.isSessionValid(currentSessionId)) {
+                _uiState.value = _uiState.value.copy(isLoading = false)
+                return@launch
+            }
+
             _uiState.value = _uiState.value.copy(
                 isLoading = false,
                 isNoteEditorOpen = false,
@@ -137,11 +152,20 @@ class VaultViewModel : ViewModel() {
         }
     }
 
+    /**
+     * P1.07 fix: Verifies session validity when decryption finishes.
+     * Prevents stale decrypted data from leaking if session was revoked during async operation.
+     */
     fun openItem(item: VaultMediaItem) {
+        val capturedSessionId = sessionManager.sessionId.value
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true, selectedItem = item)
             if (item.itemType == VaultItemType.NOTE) {
                 val content = vaultRepository.readNoteContent(item)
+                if (!sessionManager.isSessionValid(capturedSessionId)) {
+                    _uiState.value = _uiState.value.copy(isLoading = false)
+                    return@launch
+                }
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
                     activeNoteContent = content,
@@ -149,6 +173,10 @@ class VaultViewModel : ViewModel() {
                 )
             } else {
                 val bytes = vaultRepository.decryptItemBytes(item)
+                if (!sessionManager.isSessionValid(capturedSessionId)) {
+                    _uiState.value = _uiState.value.copy(isLoading = false)
+                    return@launch
+                }
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
                     decryptedBytes = bytes,
@@ -187,7 +215,7 @@ class VaultViewModel : ViewModel() {
             vaultRepository.securelyDeleteItem(item)
             closeViewer()
             closeNoteEditor()
-            _uiState.value = _uiState.value.copy(message = "Đã ghi đè và xóa an toàn khỏi bộ nhớ")
+            _uiState.value = _uiState.value.copy(message = "Đã ghi đè toàn bộ tệp và xóa an toàn")
         }
     }
 

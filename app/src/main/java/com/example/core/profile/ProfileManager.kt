@@ -18,6 +18,7 @@ import com.example.admin.SecureFolderAdminReceiver
 /**
  * Core Engine for Profile Lockdown, Process Freezing, and App Sandboxing.
  * Interacts directly with DevicePolicyManager, LauncherApps, and UserManager.
+ * Enforces zero-fake clone results and strict isolation bounds.
  */
 class ProfileManager(
     private val context: Context,
@@ -42,10 +43,14 @@ class ProfileManager(
      * - Wakes up and unfreezes Work Profile processes
      */
     fun setProfileLocked(locked: Boolean): Boolean {
+        val workHandle = provisioningManager.getWorkProfileUserHandle()
+        if (workHandle == null && !provisioningManager.isProfileOwner()) {
+            Log.d(TAG, "No active Work Profile available to freeze/unfreeze")
+            return false
+        }
+
         return try {
-            val workHandle = provisioningManager.getWorkProfileUserHandle()
             if (workHandle != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                // Request quiet mode to freeze or unfreeze the managed profile processes
                 userManager.requestQuietModeEnabled(locked, workHandle)
                 Log.i(TAG, "Managed profile quiet mode set to $locked")
             }
@@ -55,7 +60,7 @@ class ProfileManager(
                     try {
                         dpm.lockNow()
                     } catch (e: Exception) {
-                        Log.w(TAG, "lockNow fallback: ${e.message}")
+                        Log.w(TAG, "lockNow: ${e.message}")
                     }
                 } else {
                     try {
@@ -73,21 +78,36 @@ class ProfileManager(
     }
 
     /**
-     * Native App Cloning:
-     * Installs an existing host app (User 0) into the Secure Folder Managed Profile.
+     * Native App Cloning (P0.02 fix):
+     * Strictly verifies Profile Owner status. If not Profile Owner, returns false.
+     * Never falsely reports success.
      */
     fun cloneAppIntoSecureFolder(packageName: String): Boolean {
+        if (!provisioningManager.isProfileOwner()) {
+            Log.w(TAG, "Cannot clone app $packageName: Device Admin / Profile Owner is not active.")
+            return false
+        }
+
         return try {
-            if (provisioningManager.isProfileOwner()) {
-                val success = dpm.installExistingPackage(adminComponent, packageName)
-                Log.i(TAG, "installExistingPackage for $packageName result: $success")
-                success
-            } else {
-                Log.i(TAG, "Provisioning profile owner not active, recording clone registration for $packageName")
-                true
-            }
+            val success = dpm.installExistingPackage(adminComponent, packageName)
+            Log.i(TAG, "installExistingPackage for $packageName result: $success")
+            success
         } catch (e: Exception) {
             Log.e(TAG, "Failed to clone app $packageName", e)
+            false
+        }
+    }
+
+    /**
+     * Unclones / hides app from the Managed Profile (P1.02 fix).
+     */
+    fun uncloneApp(packageName: String): Boolean {
+        if (!provisioningManager.isProfileOwner()) return true
+        return try {
+            dpm.setApplicationHidden(adminComponent, packageName, true)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to hide/uninstall app $packageName in managed profile", e)
             false
         }
     }
@@ -120,6 +140,7 @@ class ProfileManager(
 
     /**
      * Launches an application instance inside the target profile.
+     * P0.10 fix: NEVER fallback to opening in personal profile!
      */
     fun launchApp(
         componentName: ComponentName,
@@ -130,20 +151,8 @@ class ProfileManager(
             launcherApps.startMainActivity(componentName, userHandle, sourceBounds, null)
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch main activity for ${componentName.packageName}", e)
-            try {
-                val launchIntent = context.packageManager.getLaunchIntentForPackage(componentName.packageName)
-                if (launchIntent != null) {
-                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(launchIntent)
-                    true
-                } else {
-                    false
-                }
-            } catch (e2: Exception) {
-                Log.e(TAG, "Fallback launch failed", e2)
-                false
-            }
+            Log.e(TAG, "Failed to launch main activity for ${componentName.packageName} in isolated profile", e)
+            false
         }
     }
 }

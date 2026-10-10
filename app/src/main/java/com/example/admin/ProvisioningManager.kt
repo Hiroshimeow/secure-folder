@@ -4,10 +4,12 @@ import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.LauncherApps
 import android.os.Build
 import android.os.Process
 import android.os.UserHandle
 import android.os.UserManager
+import android.util.Log
 
 enum class ProfileEnvironment {
     MAIN_PROFILE,
@@ -24,11 +26,13 @@ enum class ProvisioningState {
 
 /**
  * Manages Android Enterprise Work Profile provisioning and status detection.
+ * Enforces precise Work Profile identification (filtering out OEM users 95, 150 on Samsung devices).
  */
 class ProvisioningManager(private val context: Context) {
 
     private val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
     private val userManager = context.getSystemService(Context.USER_SERVICE) as UserManager
+    private val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps
     val adminComponent: ComponentName = SecureFolderAdminReceiver.getComponentName(context)
 
     fun getEnvironment(): ProfileEnvironment {
@@ -55,15 +59,39 @@ class ProvisioningManager(private val context: Context) {
         }
     }
 
+    /**
+     * Precisely locates the Work Profile user handle (P1.01 fix).
+     * Filters against LauncherApps profiles and verifies quiet mode / profile owner capability,
+     * avoiding false positives on Samsung Dual Messenger (user 95) or system containers.
+     */
     fun getWorkProfileUserHandle(): UserHandle? {
         val myHandle = Process.myUserHandle()
-        for (handle in userManager.userProfiles) {
-            if (handle != myHandle) {
-                // This is the secondary/managed profile handle
-                return handle
-            }
+        if (userManager.isManagedProfile) {
+            return myHandle
         }
-        return if (userManager.isManagedProfile) myHandle else null
+
+        try {
+            val candidateProfiles = launcherApps.profiles
+            for (handle in candidateProfiles) {
+                if (handle == myHandle) continue
+
+                // Verify quiet mode or managed profile semantics
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    try {
+                        // isQuietModeEnabled is specifically valid for Managed Work Profiles
+                        userManager.isQuietModeEnabled(handle)
+                        return handle
+                    } catch (e: Exception) {
+                        Log.d("ProvisioningManager", "User $handle is not a standard work profile: ${e.message}")
+                    }
+                } else {
+                    return handle
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("ProvisioningManager", "Error querying profiles from LauncherApps", e)
+        }
+        return null
     }
 
     fun getPersonalUserHandle(): UserHandle {
@@ -71,7 +99,8 @@ class ProvisioningManager(private val context: Context) {
         if (!userManager.isManagedProfile) {
             return myHandle
         }
-        for (handle in userManager.userProfiles) {
+        val candidateProfiles = launcherApps.profiles
+        for (handle in candidateProfiles) {
             if (handle != myHandle) {
                 return handle
             }
@@ -103,7 +132,7 @@ class ProvisioningManager(private val context: Context) {
             putExtra(DevicePolicyManager.EXTRA_PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME, adminComponent)
             putExtra(DevicePolicyManager.EXTRA_PROVISIONING_SKIP_ENCRYPTION, false)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                putExtra(DevicePolicyManager.EXTRA_PROVISIONING_DISCLAIMER_HEADER, "Samsung Secure Folder")
+                putExtra(DevicePolicyManager.EXTRA_PROVISIONING_DISCLAIMER_HEADER, "Không gian Bảo mật Work Profile")
             }
         }
     }

@@ -1,44 +1,36 @@
 package com.example.ui.lock
 
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.Backspace
-import androidx.compose.material.icons.filled.Calculate
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Fingerprint
-import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockClock
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -58,6 +50,7 @@ import com.example.ui.theme.OneUiLockRed
 import com.example.ui.theme.OneUiTealBright
 import com.example.ui.theme.OneUiTealPrimary
 import com.example.viewmodel.LockViewModel
+import com.example.viewmodel.PinSetupPhase
 
 @Composable
 fun LockScreen(
@@ -68,9 +61,9 @@ fun LockScreen(
     val context = LocalContext.current
     val activity = context as? FragmentActivity
 
-    // Trigger biometrics automatically if configured
-    LaunchedEffect(Unit) {
-        if (!state.isDisguised && activity != null) {
+    // Trigger biometrics only if enabled, vault is setup, and not disguised (P1.05 fix)
+    LaunchedEffect(state.isPinSetup, state.useBiometrics) {
+        if (!state.isDisguised && state.isPinSetup && state.useBiometrics && activity != null) {
             viewModel.promptBiometrics(activity)
         }
     }
@@ -80,7 +73,7 @@ fun LockScreen(
             .fillMaxSize()
             .background(OneUiDarkBackground)
     ) {
-        if (state.isDisguised) {
+        if (state.isDisguised && state.isPinSetup) {
             CalculatorDisguiseView(viewModel = viewModel)
         } else {
             OneUiPinLockView(
@@ -98,61 +91,63 @@ private fun OneUiPinLockView(
 ) {
     val state by viewModel.uiState.collectAsState()
 
+    val headerTitle = if (!state.isPinSetup) {
+        if (state.pinSetupPhase == PinSetupPhase.CONFIRM_NEW_PIN) "Xác nhận mã PIN" else "Thiết lập mã PIN Bảo mật"
+    } else {
+        "Thư mục Bảo mật"
+    }
+
+    val headerSubtitle = if (!state.isPinSetup) {
+        if (state.pinSetupPhase == PinSetupPhase.CONFIRM_NEW_PIN) "Nhập lại mã PIN để kích hoạt bảo vệ" else "Nhập mã PIN mới (4 đến 6 chữ số)"
+    } else {
+        "Nhập mã PIN để mở khóa"
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 24.dp, vertical = 32.dp),
+            .padding(horizontal = 24.dp, vertical = 28.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.SpaceBetween
     ) {
         // Top Security Header
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(top = 28.dp)
+            modifier = Modifier.padding(top = 20.dp)
         ) {
             Box(
                 modifier = Modifier
-                    .size(76.dp)
+                    .size(72.dp)
                     .clip(CircleShape)
                     .background(OneUiTealPrimary.copy(alpha = 0.15f)),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = Icons.Default.Security,
-                    contentDescription = "Samsung Knox Security",
-                    tint = OneUiTealBright,
-                    modifier = Modifier.size(40.dp)
+                    imageVector = if (state.lockoutRemainingSeconds > 0) Icons.Default.LockClock else Icons.Default.Security,
+                    contentDescription = null,
+                    tint = if (state.lockoutRemainingSeconds > 0) OneUiLockRed else OneUiTealBright,
+                    modifier = Modifier.size(38.dp)
                 )
             }
 
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(16.dp))
 
             Text(
-                text = "Thư mục Bảo mật",
+                text = headerTitle,
                 style = MaterialTheme.typography.headlineMedium.copy(
                     fontWeight = FontWeight.Bold,
                     color = OneUiDarkTextPrimary,
-                    fontSize = 24.sp
+                    fontSize = 22.sp
                 )
             )
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
             Text(
-                text = "Nhập mã PIN để mở khóa",
+                text = headerSubtitle,
                 style = MaterialTheme.typography.bodyMedium.copy(
-                    color = OneUiDarkTextPrimary,
-                    fontWeight = FontWeight.Medium
-                )
-            )
-
-            Spacer(modifier = Modifier.height(4.dp))
-
-            Text(
-                text = "Mã PIN mặc định: 1234 (Đổi trong Cài đặt)",
-                style = MaterialTheme.typography.bodySmall.copy(
-                    color = OneUiTealBright,
-                    fontSize = 12.sp
+                    color = OneUiDarkTextSecondary,
+                    textAlign = TextAlign.Center
                 )
             )
 
@@ -163,8 +158,8 @@ private fun OneUiPinLockView(
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                val pinLength = 4
-                for (i in 0 until pinLength) {
+                val pinLength = maxOf(4, state.pinInput.length)
+                for (i in 0 until maxOf(4, pinLength)) {
                     val isFilled = i < state.pinInput.length
                     Box(
                         modifier = Modifier
@@ -177,14 +172,39 @@ private fun OneUiPinLockView(
                 }
             }
 
-            // Error message
+            // Error or Lockout Message
             if (state.errorMessage != null) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
                     text = state.errorMessage ?: "",
                     color = OneUiLockRed,
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
                     textAlign = TextAlign.Center
+                )
+            }
+        }
+
+        // Action button during PIN setup
+        if (!state.isPinSetup && state.pinInput.length >= 4) {
+            Button(
+                onClick = { viewModel.submitPinSetup() },
+                colors = ButtonDefaults.buttonColors(containerColor = OneUiTealPrimary),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth(0.75f)
+                    .height(48.dp)
+                    .testTag("submit_pin_setup_button")
+            ) {
+                Text(
+                    text = if (state.pinSetupPhase == PinSetupPhase.CONFIRM_NEW_PIN) "Xác nhận & Mở khóa" else "Tiếp tục",
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+                Spacer(modifier = Modifier.size(8.dp))
+                Icon(
+                    imageVector = if (state.pinSetupPhase == PinSetupPhase.CONFIRM_NEW_PIN) Icons.Default.Check else Icons.Default.ArrowForward,
+                    contentDescription = null,
+                    tint = Color.White
                 )
             }
         }
@@ -199,7 +219,7 @@ private fun OneUiPinLockView(
                 listOf("1", "2", "3"),
                 listOf("4", "5", "6"),
                 listOf("7", "8", "9"),
-                listOf("BIO", "0", "DEL")
+                listOf("ACTION", "0", "DEL")
             )
 
             for (row in keyRows) {
@@ -209,23 +229,36 @@ private fun OneUiPinLockView(
                 ) {
                     for (key in row) {
                         when (key) {
-                            "BIO" -> {
+                            "ACTION" -> {
                                 Box(
                                     modifier = Modifier
                                         .size(72.dp)
                                         .clip(CircleShape)
                                         .clickable {
-                                            activity?.let { viewModel.promptBiometrics(it) }
+                                            if (state.isPinSetup && state.useBiometrics) {
+                                                activity?.let { viewModel.promptBiometrics(it) }
+                                            } else if (!state.isPinSetup && state.pinInput.length >= 4) {
+                                                viewModel.submitPinSetup()
+                                            }
                                         }
                                         .testTag("biometric_button"),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Fingerprint,
-                                        contentDescription = "Vân tay",
-                                        tint = OneUiTealBright,
-                                        modifier = Modifier.size(34.dp)
-                                    )
+                                    if (state.isPinSetup && state.useBiometrics) {
+                                        Icon(
+                                            imageVector = Icons.Default.Fingerprint,
+                                            contentDescription = "Vân tay",
+                                            tint = OneUiTealBright,
+                                            modifier = Modifier.size(34.dp)
+                                        )
+                                    } else if (!state.isPinSetup && state.pinInput.length >= 4) {
+                                        Icon(
+                                            imageVector = Icons.Default.Check,
+                                            contentDescription = "Hoàn tất",
+                                            tint = OneUiTealBright,
+                                            modifier = Modifier.size(28.dp)
+                                        )
+                                    }
                                 }
                             }
                             "DEL" -> {
@@ -273,11 +306,11 @@ private fun OneUiPinLockView(
 
         // Bottom Footer
         Text(
-            text = "Bảo vệ bởi Knox TEE / Android Enterprise DPC",
+            text = "Xác thực Salted SHA-256 / Android Enterprise DPC",
             style = MaterialTheme.typography.labelSmall.copy(
                 color = OneUiDarkTextSecondary.copy(alpha = 0.6f)
             ),
-            modifier = Modifier.padding(bottom = 8.dp)
+            modifier = Modifier.padding(bottom = 6.dp)
         )
     }
 }
