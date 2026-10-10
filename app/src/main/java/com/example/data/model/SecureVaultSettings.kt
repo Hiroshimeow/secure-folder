@@ -7,6 +7,7 @@ package com.example.data.model
 data class SecureVaultSettings(
     val isLocked: Boolean = true,
     val isPinSetup: Boolean = false,
+    val pinLength: Int = 4,
     val pinSalt: String = "",
     val pinHash: String = "",
     val useBiometrics: Boolean = true,

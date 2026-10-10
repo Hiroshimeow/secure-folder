@@ -4,9 +4,11 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
 import com.example.data.model.SecureVaultSettings
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 import java.security.MessageDigest
 import java.security.SecureRandom
 import javax.crypto.SecretKeyFactory
@@ -23,6 +25,7 @@ class SettingsRepository(context: Context) {
         private const val PREFS_NAME = "secure_folder_prefs"
         private const val KEY_PIN_SALT = "vault_pin_salt"
         private const val KEY_PIN_HASH = "vault_pin_hash"
+        private const val KEY_PIN_LENGTH = "vault_pin_length"
         private const val KEY_PIN_SETUP = "is_pin_setup"
         private const val KEY_BIOMETRICS = "use_biometrics"
         private const val KEY_DISGUISE = "is_disguised"
@@ -41,6 +44,7 @@ class SettingsRepository(context: Context) {
         SecureVaultSettings(
             isLocked = true,
             isPinSetup = prefs.getBoolean(KEY_PIN_SETUP, false),
+            pinLength = prefs.getInt(KEY_PIN_LENGTH, 4),
             pinSalt = prefs.getString(KEY_PIN_SALT, "") ?: "",
             pinHash = prefs.getString(KEY_PIN_HASH, "") ?: "",
             useBiometrics = prefs.getBoolean(KEY_BIOMETRICS, true),
@@ -56,12 +60,13 @@ class SettingsRepository(context: Context) {
     }
 
     /**
-     * Sets or changes the PIN with a cryptographically secure random salt and SHA-256 iterations.
+     * Sets or changes the PIN with a cryptographically secure random salt and PBKDF2.
      * Enforces digits-only validation (4-6 digits).
+     * Automatically computes on IO/Default dispatcher and persists pinLength.
      */
-    fun setPin(pin: String): Boolean {
+    suspend fun setPin(pin: String): Boolean = withContext(Dispatchers.Default) {
         if (pin.length !in 4..6 || !pin.all { it.isDigit() }) {
-            return false
+            return@withContext false
         }
         val saltBytes = ByteArray(16)
         SecureRandom().nextBytes(saltBytes)
@@ -71,15 +76,17 @@ class SettingsRepository(context: Context) {
         prefs.edit()
             .putString(KEY_PIN_SALT, saltBase64)
             .putString(KEY_PIN_HASH, hashBase64)
+            .putInt(KEY_PIN_LENGTH, pin.length)
             .putBoolean(KEY_PIN_SETUP, true)
             .apply()
 
         _settings.value = _settings.value.copy(
             isPinSetup = true,
+            pinLength = pin.length,
             pinSalt = saltBase64,
             pinHash = hashBase64
         )
-        return true
+        true
     }
 
     fun setUseBiometrics(use: Boolean) {
@@ -99,17 +106,18 @@ class SettingsRepository(context: Context) {
 
     /**
      * Constant-time comparison of hashed PIN with stored salt.
+     * Offloaded strictly to background thread (Dispatchers.Default) to never freeze the UI.
      */
-    fun verifyPin(inputPin: String): Boolean {
-        if (!_settings.value.isPinSetup) return false
+    suspend fun verifyPin(inputPin: String): Boolean = withContext(Dispatchers.Default) {
+        if (!_settings.value.isPinSetup) return@withContext false
         val saltBase64 = _settings.value.pinSalt
         val expectedHash = _settings.value.pinHash
-        if (saltBase64.isEmpty() || expectedHash.isEmpty()) return false
+        if (saltBase64.isEmpty() || expectedHash.isEmpty()) return@withContext false
 
         val saltBytes = Base64.decode(saltBase64, Base64.NO_WRAP)
         val actualHash = computeHash(inputPin, saltBytes)
 
-        return MessageDigest.isEqual(
+        MessageDigest.isEqual(
             actualHash.toByteArray(Charsets.UTF_8),
             expectedHash.toByteArray(Charsets.UTF_8)
         )
@@ -141,6 +149,7 @@ class SettingsRepository(context: Context) {
         _settings.value = SecureVaultSettings(
             isLocked = true,
             isPinSetup = false,
+            pinLength = 4,
             pinSalt = "",
             pinHash = "",
             useBiometrics = true,

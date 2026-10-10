@@ -221,8 +221,8 @@ fun SettingsScreen(
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     StatusRow(
-                        label = "Trạng thái Profile Owner",
-                        value = if (provisioningMgr.isProfileOwner()) "Hoạt động (Active)" else "Mã hóa cục bộ"
+                        label = "Trạng thái Work Profile (DPC)",
+                        value = if (provisioningMgr.isWorkProfileActive()) "Hoạt động (Active)" else "Mã hóa cục bộ"
                     )
                 }
             }
@@ -303,10 +303,10 @@ fun SettingsScreen(
                         } else if (newPin != confirmPin) {
                             pinError = "Mã PIN xác nhận không trùng khớp."
                         } else {
-                            val success = settingsRepo.setPin(newPin)
-                            if (success) {
-                                showChangePinDialog = false
-                                scope.launch {
+                            scope.launch {
+                                val success = settingsRepo.setPin(newPin)
+                                if (success) {
+                                    showChangePinDialog = false
                                     snackbarHostState.showSnackbar("Đã đổi mã PIN thành công")
                                 }
                             }

@@ -158,8 +158,8 @@ private fun OneUiPinLockView(
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                val pinLength = maxOf(4, state.pinInput.length)
-                for (i in 0 until maxOf(4, pinLength)) {
+                val totalDots = if (state.isPinSetup) state.pinLength else maxOf(4, state.pinInput.length)
+                for (i in 0 until totalDots) {
                     val isFilled = i < state.pinInput.length
                     Box(
                         modifier = Modifier
@@ -235,16 +235,25 @@ private fun OneUiPinLockView(
                                         .size(72.dp)
                                         .clip(CircleShape)
                                         .clickable {
-                                            if (state.isPinSetup && state.useBiometrics) {
+                                            if (state.isPinSetup && state.pinInput.length >= 4) {
+                                                viewModel.submitCandidatePin()
+                                            } else if (state.isPinSetup && state.useBiometrics) {
                                                 activity?.let { viewModel.promptBiometrics(it) }
                                             } else if (!state.isPinSetup && state.pinInput.length >= 4) {
                                                 viewModel.submitPinSetup()
                                             }
                                         }
-                                        .testTag("biometric_button"),
+                                        .testTag("action_key_button"),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    if (state.isPinSetup && state.useBiometrics) {
+                                    if (state.isPinSetup && state.pinInput.length >= 4) {
+                                        Icon(
+                                            imageVector = Icons.Default.Check,
+                                            contentDescription = "Xác nhận",
+                                            tint = OneUiTealBright,
+                                            modifier = Modifier.size(28.dp)
+                                        )
+                                    } else if (state.isPinSetup && state.useBiometrics) {
                                         Icon(
                                             imageVector = Icons.Default.Fingerprint,
                                             contentDescription = "Vân tay",

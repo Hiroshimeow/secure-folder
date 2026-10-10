@@ -21,6 +21,7 @@ data class HomeUiState(
     val provisioningState: ProvisioningState = ProvisioningState.NOT_PROVISIONED,
     val profileEnvironment: ProfileEnvironment = ProfileEnvironment.MAIN_PROFILE,
     val isProfileOwner: Boolean = false,
+    val isWorkProfileActive: Boolean = false,
     val statusMessage: String? = null
 )
 
@@ -44,11 +45,13 @@ class FolderHomeViewModel : ViewModel() {
     fun checkProfileStatus() {
         val env = provisioningManager.getEnvironment()
         val isOwner = provisioningManager.isProfileOwner()
+        val isActive = provisioningManager.isWorkProfileActive()
         val provState = provisioningManager.checkProvisioningState()
 
         _uiState.value = _uiState.value.copy(
             profileEnvironment = env,
             isProfileOwner = isOwner,
+            isWorkProfileActive = isActive,
             provisioningState = provState
         )
     }
@@ -91,7 +94,7 @@ class FolderHomeViewModel : ViewModel() {
                 statusMessage = if (success) {
                     "Đã nhân bản ${app.appLabel} vào hồ sơ bảo mật thành công"
                 } else {
-                    "Không thể nhân bản: Chưa kích hoạt Profile Owner (Android Enterprise Work Profile)"
+                    "Không thể nhân bản: Work Profile chưa được kích hoạt hoặc không thể tạo bản sao."
                 }
             )
         }
@@ -108,11 +111,11 @@ class FolderHomeViewModel : ViewModel() {
         appRepository.launchClonedApp(app)
     }
 
-    fun getProvisioningIntent(): Intent {
-        return provisioningManager.createProvisioningIntent()
-    }
-
     fun clearStatusMessage() {
         _uiState.value = _uiState.value.copy(statusMessage = null)
+    }
+
+    fun getProvisioningIntent(): Intent {
+        return provisioningManager.getProvisioningIntent()
     }
 }

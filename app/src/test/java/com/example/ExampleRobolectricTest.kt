@@ -3,6 +3,7 @@ package com.example
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.repository.SettingsRepository
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
@@ -32,7 +33,7 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun testSettingsRepository_setPinAndVerifyWithPBKDF2() {
+    fun testSettingsRepository_setPinAndVerifyWithPBKDF2() = runBlocking {
         val settingsRepo = SettingsRepository(app)
         settingsRepo.resetAllSettings()
 
@@ -46,6 +47,7 @@ class ExampleRobolectricTest {
         // Valid pin
         assertTrue("Valid 4-digit PIN should succeed", settingsRepo.setPin("2580"))
         assertTrue("PIN setup flag should be true", settingsRepo.settings.value.isPinSetup)
+        assertEquals("PIN length should be recorded as 4", 4, settingsRepo.settings.value.pinLength)
 
         // Verify correct pin
         assertTrue("Correct PIN verification should succeed", settingsRepo.verifyPin("2580"))

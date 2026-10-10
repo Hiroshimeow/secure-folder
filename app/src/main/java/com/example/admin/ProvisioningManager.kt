@@ -3,7 +3,6 @@ package com.example.admin
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
 import android.content.pm.LauncherApps
 import android.os.Build
 import android.os.Process
@@ -13,8 +12,7 @@ import android.util.Log
 
 enum class ProfileEnvironment {
     MAIN_PROFILE,
-    MANAGED_PROFILE,
-    UNKNOWN
+    MANAGED_PROFILE
 }
 
 enum class ProvisioningState {
@@ -25,8 +23,12 @@ enum class ProvisioningState {
 }
 
 /**
- * Manages Android Enterprise Work Profile provisioning and status detection.
- * Enforces precise Work Profile identification (filtering out OEM users 95, 150 on Samsung devices).
+ * Enterprise Work Profile and Device Policy Manager orchestrator.
+ * Crucial Architecture:
+ * - User 0 is the Personal Profile (isProfileOwner is FALSE).
+ * - User 11 is the Managed Work Profile (isProfileOwner is TRUE).
+ * - System is considered Active if either current user is Profile Owner OR a Managed Work Profile
+ *   handle exists and belongs to this DPC container.
  */
 class ProvisioningManager(private val context: Context) {
 
@@ -43,12 +45,23 @@ class ProvisioningManager(private val context: Context) {
         }
     }
 
+    /**
+     * Checks if current calling user is Profile Owner.
+     */
     fun isProfileOwner(): Boolean {
         return try {
             dpm.isProfileOwnerApp(context.packageName)
         } catch (e: Exception) {
             false
         }
+    }
+
+    /**
+     * Checks if the overall Work Profile architecture is active and provisioned.
+     * True if current user is Profile Owner OR a valid Work Profile user handle exists!
+     */
+    fun isWorkProfileActive(): Boolean {
+        return isProfileOwner() || getWorkProfileUserHandle() != null
     }
 
     fun isAdminActive(): Boolean {
@@ -61,8 +74,11 @@ class ProvisioningManager(private val context: Context) {
 
     /**
      * Precisely locates the Work Profile user handle.
-     * Filters against LauncherApps profiles, filters out OEM clones (Samsung Dual Messenger user 95),
-     * and verifies enterprise managed profile status.
+     * Accurately filters out:
+     * - Current user handle (User 0)
+     * - Samsung Dual Messenger (User 95)
+     * - Samsung Knox Secure Folder native container (User 150)
+     * And validates Managed Profile status via LauncherApps & UserManager.
      */
     fun getWorkProfileUserHandle(): UserHandle? {
         val myHandle = Process.myUserHandle()
@@ -75,21 +91,19 @@ class ProvisioningManager(private val context: Context) {
             for (handle in candidateProfiles) {
                 if (handle == myHandle) continue
 
-                // Explicitly filter out Samsung Dual Messenger (User 95)
                 val handleStr = handle.toString()
-                if (handleStr.contains("95") || handle.hashCode() == 95) {
-                    Log.d("ProvisioningManager", "Skipping Samsung Dual Messenger container ($handle)")
+                // Explicitly filter out Samsung Dual Messenger (User 95) and Secure Folder OEM (User 150)
+                if (handleStr.contains("95") || handle.hashCode() == 95 ||
+                    handleStr.contains("150") || handle.hashCode() == 150) {
+                    Log.d("ProvisioningManager", "Skipping Samsung OEM dual/secure container ($handle)")
                     continue
                 }
 
-                // Verify quiet mode and profile semantics
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     try {
-                        // In Android, only Managed Work Profiles support quiet mode requests.
-                        // Clone profiles and secondary personal users throw IllegalArgumentException.
+                        // In Android, only Managed Work Profiles support quiet mode check
                         userManager.isQuietModeEnabled(handle)
 
-                        // Ensure user is not an unmanaged clone/guest profile
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                             if (!userManager.isProfile) {
                                 continue
@@ -125,7 +139,7 @@ class ProvisioningManager(private val context: Context) {
     }
 
     fun checkProvisioningState(): ProvisioningState {
-        if (isProfileOwner() || getWorkProfileUserHandle() != null) {
+        if (isWorkProfileActive()) {
             return ProvisioningState.ALREADY_PROVISIONED
         }
 
@@ -140,16 +154,12 @@ class ProvisioningManager(private val context: Context) {
         }
     }
 
-    /**
-     * Builds the Intent to initiate Android OS Work Profile setup.
-     */
-    fun createProvisioningIntent(): Intent {
-        return Intent(DevicePolicyManager.ACTION_PROVISION_MANAGED_PROFILE).apply {
-            putExtra(DevicePolicyManager.EXTRA_PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME, adminComponent)
-            putExtra(DevicePolicyManager.EXTRA_PROVISIONING_SKIP_ENCRYPTION, false)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                putExtra(DevicePolicyManager.EXTRA_PROVISIONING_DISCLAIMER_HEADER, "Không gian Bảo mật Work Profile")
-            }
+    fun getProvisioningIntent(): android.content.Intent {
+        return android.content.Intent(DevicePolicyManager.ACTION_PROVISION_MANAGED_PROFILE).apply {
+            putExtra(
+                DevicePolicyManager.EXTRA_DEVICE_ADMIN,
+                adminComponent
+            )
         }
     }
 }

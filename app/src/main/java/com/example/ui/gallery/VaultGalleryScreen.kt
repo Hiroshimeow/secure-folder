@@ -151,10 +151,12 @@ fun VaultGalleryScreen(
     LaunchedEffect(state.pendingDeleteIntentSender) {
         state.pendingDeleteIntentSender?.let { sender ->
             try {
+                com.example.MainActivity.isLaunchingSystemIntent = true
                 intentSenderLauncher.launch(
                     IntentSenderRequest.Builder(sender).build()
                 )
             } catch (e: Exception) {
+                com.example.MainActivity.isLaunchingSystemIntent = false
                 viewModel.onOsDeleteConsentResult(false)
             }
         }
@@ -353,6 +355,7 @@ fun VaultGalleryScreen(
                             .clickable {
                                 selectedImportMode = ImportMode.COPY
                                 showImportModeDialog = false
+                                com.example.MainActivity.isLaunchingSystemIntent = true
                                 filePicker.launch(arrayOf("*/*"))
                             },
                         shape = RoundedCornerShape(14.dp),
@@ -379,6 +382,7 @@ fun VaultGalleryScreen(
                             .clickable {
                                 selectedImportMode = ImportMode.MOVE
                                 showImportModeDialog = false
+                                com.example.MainActivity.isLaunchingSystemIntent = true
                                 filePicker.launch(arrayOf("*/*"))
                             },
                         shape = RoundedCornerShape(14.dp),

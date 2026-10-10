@@ -7,6 +7,7 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.SecureFolderApp
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -22,11 +23,13 @@ enum class PinSetupPhase {
 data class LockUiState(
     val isLocked: Boolean = true,
     val isPinSetup: Boolean = false,
+    val pinLength: Int = 4,
     val isDisguised: Boolean = false,
     val pinSetupPhase: PinSetupPhase = PinSetupPhase.NOT_IN_SETUP,
     val pinInput: String = "",
     val firstEnteredPin: String = "",
     val errorMessage: String? = null,
+    val isVerifying: Boolean = false,
     val calculatorDisplay: String = "0",
     val calculatorExpression: String = "",
     val failedAttempts: Int = 0,
@@ -43,6 +46,7 @@ class LockViewModel : ViewModel() {
     val uiState: StateFlow<LockUiState> = _uiState.asStateFlow()
 
     private var lockoutUntilMillis: Long = 0L
+    private var verificationJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -51,6 +55,7 @@ class LockViewModel : ViewModel() {
                 _uiState.value = _uiState.value.copy(
                     isLocked = settings.isLocked,
                     isPinSetup = isSetup,
+                    pinLength = settings.pinLength,
                     isDisguised = settings.isDisguisedAsCalculator,
                     useBiometrics = settings.useBiometrics,
                     pinSetupPhase = if (!isSetup) PinSetupPhase.ENTER_NEW_PIN else PinSetupPhase.NOT_IN_SETUP
@@ -72,6 +77,13 @@ class LockViewModel : ViewModel() {
         }
     }
 
+    /**
+     * Fast keypad response:
+     * 1. Updates UI state immediately without stalling the main thread.
+     * 2. In normal unlock flow, triggers asynchronous PBKDF2 verification ONLY when candidate
+     *    reaches the exact configured pinLength (e.g. 4 or 6).
+     * 3. Prevents duplicate verification runs using cancellation.
+     */
     fun onPinDigit(digit: String) {
         if (_uiState.value.lockoutRemainingSeconds > 0) {
             _uiState.value = _uiState.value.copy(
@@ -80,25 +92,49 @@ class LockViewModel : ViewModel() {
             return
         }
 
+        if (_uiState.value.isVerifying) {
+            // Already verifying candidate, prevent typing race
+            return
+        }
+
         val current = _uiState.value.pinInput
-        if (current.length < 6) {
+        val targetLength = if (_uiState.value.isPinSetup) _uiState.value.pinLength else 6
+        if (current.length < targetLength) {
             val updated = current + digit
             _uiState.value = _uiState.value.copy(pinInput = updated, errorMessage = null)
 
-            // If in initial setup flow
+            // If in initial setup flow, do not auto-verify against old pin
             if (!_uiState.value.isPinSetup) {
                 return
             }
 
-            // Normal Unlock Flow:
-            if (updated.length >= 4) {
-                if (settingsRepository.verifyPin(updated)) {
-                    _uiState.value = _uiState.value.copy(failedAttempts = 0)
-                    unlockVault()
-                } else if (updated.length == 6) {
-                    // Maximum 6 digits reached and incorrect
-                    handleFailedAttempt()
-                }
+            // Normal Unlock Flow: verify ONLY when candidate reaches configured pinLength!
+            if (updated.length == _uiState.value.pinLength) {
+                submitCandidatePin(updated)
+            }
+        }
+    }
+
+    /**
+     * Explicit or auto-submit candidate PIN.
+     * Cancels any in-flight job, runs PBKDF2 on background dispatcher, and updates UI on completion.
+     */
+    fun submitCandidatePin(candidate: String = _uiState.value.pinInput) {
+        if (candidate.length < 4 || _uiState.value.lockoutRemainingSeconds > 0) {
+            return
+        }
+
+        verificationJob?.cancel()
+        verificationJob = viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isVerifying = true)
+            val isCorrect = settingsRepository.verifyPin(candidate)
+            _uiState.value = _uiState.value.copy(isVerifying = false)
+
+            if (isCorrect) {
+                _uiState.value = _uiState.value.copy(failedAttempts = 0)
+                unlockVault()
+            } else {
+                handleFailedAttempt()
             }
         }
     }
@@ -121,15 +157,19 @@ class LockViewModel : ViewModel() {
             }
             PinSetupPhase.CONFIRM_NEW_PIN -> {
                 if (input == _uiState.value.firstEnteredPin) {
-                    val success = settingsRepository.setPin(input)
-                    if (success) {
-                        _uiState.value = _uiState.value.copy(
-                            pinSetupPhase = PinSetupPhase.NOT_IN_SETUP,
-                            pinInput = "",
-                            firstEnteredPin = "",
-                            errorMessage = null
-                        )
-                        unlockVault()
+                    viewModelScope.launch {
+                        _uiState.value = _uiState.value.copy(isVerifying = true)
+                        val success = settingsRepository.setPin(input)
+                        _uiState.value = _uiState.value.copy(isVerifying = false)
+                        if (success) {
+                            _uiState.value = _uiState.value.copy(
+                                pinSetupPhase = PinSetupPhase.NOT_IN_SETUP,
+                                pinInput = "",
+                                firstEnteredPin = "",
+                                errorMessage = null
+                            )
+                            unlockVault()
+                        }
                     }
                 } else {
                     _uiState.value = _uiState.value.copy(
@@ -145,24 +185,17 @@ class LockViewModel : ViewModel() {
     }
 
     fun onPinDelete() {
+        if (_uiState.value.isVerifying) return
+        verificationJob?.cancel()
         val current = _uiState.value.pinInput
-        // If user already typed >= 4 digits (a full candidate PIN that failed to unlock) and is deleting,
-        // treat this abandoned incorrect sequence as a failed attempt to prevent silent brute-forcing!
-        if (_uiState.value.isPinSetup && current.length >= 4) {
-            handleFailedAttempt()
-            return
-        }
         if (current.isNotEmpty()) {
             _uiState.value = _uiState.value.copy(pinInput = current.dropLast(1), errorMessage = null)
         }
     }
 
     fun onPinClear() {
-        val current = _uiState.value.pinInput
-        if (_uiState.value.isPinSetup && current.length >= 4) {
-            handleFailedAttempt()
-            return
-        }
+        if (_uiState.value.isVerifying) return
+        verificationJob?.cancel()
         _uiState.value = _uiState.value.copy(pinInput = "", errorMessage = null)
     }
 
@@ -209,6 +242,7 @@ class LockViewModel : ViewModel() {
 
     fun lockVault() {
         viewModelScope.launch {
+            verificationJob?.cancel()
             // Revoke and invalidate session token, purging RAM plaintext
             SecureFolderApp.instance.sessionManager.invalidateSession()
             // Freeze profile processes, suppress notifications
@@ -225,7 +259,7 @@ class LockViewModel : ViewModel() {
     }
 
     /**
-     * Calculator disguise logic:
+     * Calculator disguise logic with background async PIN check.
      */
     fun onCalculatorKey(key: String) {
         val currentDisplay = _uiState.value.calculatorDisplay
@@ -241,31 +275,35 @@ class LockViewModel : ViewModel() {
                     return
                 }
 
-                val isPinCandidate = (currentDisplay.length in 4..6 && currentDisplay.all { it.isDigit() }) ||
-                        (currentExpr.trim().length in 4..6 && currentExpr.trim().all { it.isDigit() })
+                val candidate1 = currentDisplay
+                val candidate2 = currentExpr.trim()
+                val isCandidate = (candidate1.length in 4..6 && candidate1.all { it.isDigit() }) ||
+                        (candidate2.length in 4..6 && candidate2.all { it.isDigit() })
 
-                // Check if the current expression or display is the secret PIN!
-                if (settingsRepository.verifyPin(currentDisplay) || settingsRepository.verifyPin(currentExpr.trim())) {
-                    _uiState.value = _uiState.value.copy(failedAttempts = 0)
-                    unlockVault()
-                    return
-                } else if (isPinCandidate && _uiState.value.isPinSetup) {
-                    // Candidate PIN attempt failed in calculator mode: track failed attempt
-                    handleFailedAttempt()
-                    if (_uiState.value.lockoutRemainingSeconds > 0) {
-                        _uiState.value = _uiState.value.copy(calculatorDisplay = "LOCKED")
-                        return
+                viewModelScope.launch {
+                    val pass1 = if (candidate1.length in 4..6 && candidate1.all { it.isDigit() }) settingsRepository.verifyPin(candidate1) else false
+                    val pass2 = if (!pass1 && candidate2.length in 4..6 && candidate2.all { it.isDigit() }) settingsRepository.verifyPin(candidate2) else false
+
+                    if (pass1 || pass2) {
+                        _uiState.value = _uiState.value.copy(failedAttempts = 0)
+                        unlockVault()
+                    } else if (isCandidate && _uiState.value.isPinSetup) {
+                        handleFailedAttempt()
+                        if (_uiState.value.lockoutRemainingSeconds > 0) {
+                            _uiState.value = _uiState.value.copy(calculatorDisplay = "LOCKED")
+                        }
+                    } else {
+                        // Standard math evaluation
+                        try {
+                            val result = evaluateMath(currentExpr + currentDisplay)
+                            _uiState.value = _uiState.value.copy(
+                                calculatorDisplay = result,
+                                calculatorExpression = ""
+                            )
+                        } catch (e: Exception) {
+                            _uiState.value = _uiState.value.copy(calculatorDisplay = "Lỗi", calculatorExpression = "")
+                        }
                     }
-                }
-                // Otherwise evaluate math
-                try {
-                    val result = evaluateMath(currentExpr + currentDisplay)
-                    _uiState.value = _uiState.value.copy(
-                        calculatorDisplay = result,
-                        calculatorExpression = ""
-                    )
-                } catch (e: Exception) {
-                    _uiState.value = _uiState.value.copy(calculatorDisplay = "Lỗi", calculatorExpression = "")
                 }
             }
             "+", "-", "×", "÷" -> {
@@ -281,69 +319,80 @@ class LockViewModel : ViewModel() {
                 }
             }
             "%" -> {
-                val num = currentDisplay.toDoubleOrNull() ?: 0.0
-                _uiState.value = _uiState.value.copy(calculatorDisplay = (num / 100.0).toString())
+                val num = currentDisplay.toDoubleOrNull()
+                if (num != null) {
+                    _uiState.value = _uiState.value.copy(calculatorDisplay = (num / 100.0).toString())
+                }
+            }
+            "." -> {
+                if (!currentDisplay.contains(".")) {
+                    _uiState.value = _uiState.value.copy(calculatorDisplay = "$currentDisplay.")
+                }
             }
             else -> {
-                val updated = if (currentDisplay == "0" && key != ".") key else currentDisplay + key
-                _uiState.value = _uiState.value.copy(calculatorDisplay = updated)
+                // Number entry
+                val newDisplay = if (currentDisplay == "0" || currentDisplay == "Lỗi" || currentDisplay == "LOCKED") key else currentDisplay + key
+                _uiState.value = _uiState.value.copy(calculatorDisplay = newDisplay)
             }
         }
     }
 
-    private fun evaluateMath(expr: String): String {
-        val parts = expr.trim().split(" ")
-        if (parts.size >= 3) {
-            val a = parts[0].toDoubleOrNull() ?: 0.0
-            val op = parts[1]
-            val b = parts[2].toDoubleOrNull() ?: 0.0
-            val res = when (op) {
-                "+" -> a + b
-                "-" -> a - b
-                "×" -> a * b
-                "÷" -> if (b != 0.0) a / b else return "Lỗi chia cho 0"
-                else -> a
+    private fun evaluateMath(expression: String): String {
+        val tokens = expression.split(" ").filter { it.isNotBlank() }
+        if (tokens.size < 3) return tokens.firstOrNull() ?: "0"
+
+        var total = tokens[0].toDoubleOrNull() ?: 0.0
+        var i = 1
+        while (i < tokens.size) {
+            val op = tokens[i]
+            val nextVal = tokens.getOrNull(i + 1)?.toDoubleOrNull() ?: 0.0
+            total = when (op) {
+                "+" -> total + nextVal
+                "-" -> total - nextVal
+                "×" -> total * nextVal
+                "÷" -> if (nextVal != 0.0) total / nextVal else return "Lỗi"
+                else -> total
             }
-            return if (res % 1.0 == 0.0) res.toLong().toString() else "%.4f".format(res).trimEnd('0').trimEnd('.')
+            i += 2
         }
-        return expr
+        return if (total % 1.0 == 0.0) total.toLong().toString() else total.toString()
     }
 
-    /**
-     * Prompts Android Biometrics only if enabled in Settings (P1.05 fix).
-     */
     fun promptBiometrics(activity: FragmentActivity) {
-        if (!_uiState.value.useBiometrics || !_uiState.value.isPinSetup) {
-            return
-        }
-
         val biometricManager = BiometricManager.from(activity)
         val canAuth = biometricManager.canAuthenticate(
-            BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL
+            BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.BIOMETRIC_WEAK
         )
         if (canAuth != BiometricManager.BIOMETRIC_SUCCESS) {
             return
         }
 
         val executor = ContextCompat.getMainExecutor(activity)
-        val prompt = BiometricPrompt(activity, executor, object : BiometricPrompt.AuthenticationCallback() {
-            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                super.onAuthenticationSucceeded(result)
-                unlockVault()
-            }
+        val prompt = BiometricPrompt(
+            activity,
+            executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    super.onAuthenticationSucceeded(result)
+                    _uiState.value = _uiState.value.copy(failedAttempts = 0)
+                    unlockVault()
+                }
 
-            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                super.onAuthenticationError(errorCode, errString)
-                if (errorCode != BiometricPrompt.ERROR_USER_CANCELED && errorCode != BiometricPrompt.ERROR_NEGATIVE_BUTTON) {
-                    _uiState.value = _uiState.value.copy(errorMessage = errString.toString())
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    super.onAuthenticationError(errorCode, errString)
+                }
+
+                override fun onAuthenticationFailed() {
+                    super.onAuthenticationFailed()
+                    _uiState.value = _uiState.value.copy(errorMessage = "Dấu vân tay không khớp.")
                 }
             }
-        })
+        )
 
         val promptInfo = BiometricPrompt.PromptInfo.Builder()
             .setTitle("Mở khóa Thư mục Bảo mật")
-            .setSubtitle("Xác thực vân tay để truy cập không gian riêng tư")
-            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+            .setSubtitle("Xác thực bằng cảm biến sinh trắc học")
+            .setNegativeButtonText("Dùng mã PIN")
             .build()
 
         prompt.authenticate(promptInfo)

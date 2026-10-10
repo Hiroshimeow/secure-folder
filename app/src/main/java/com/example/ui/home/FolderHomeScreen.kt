@@ -524,6 +524,7 @@ private fun WorkProfileStatusCard(
     state: com.example.viewmodel.HomeUiState,
     onSetupWorkProfile: () -> Unit
 ) {
+    val isWorkActive = state.isWorkProfileActive || state.isProfileOwner
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -534,8 +535,8 @@ private fun WorkProfileStatusCard(
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                val icon = if (state.isProfileOwner) Icons.Default.CheckCircle else Icons.Default.Info
-                val iconTint = if (state.isProfileOwner) OneUiTealBright else OneUiShieldGold
+                val icon = if (isWorkActive) Icons.Default.CheckCircle else Icons.Default.Info
+                val iconTint = if (isWorkActive) OneUiTealBright else OneUiShieldGold
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
@@ -544,7 +545,7 @@ private fun WorkProfileStatusCard(
                 )
                 Spacer(modifier = Modifier.width(10.dp))
                 Text(
-                    text = if (state.isProfileOwner) "Hồ sơ Cách ly Android Enterprise (DPC)" else "Không gian Ứng dụng Riêng tư",
+                    text = if (isWorkActive) "Hồ sơ Cách ly Android Enterprise (Hoạt động)" else "Không gian Ứng dụng Riêng tư",
                     style = MaterialTheme.typography.titleMedium.copy(
                         fontWeight = FontWeight.Bold,
                         color = OneUiDarkTextPrimary,
@@ -556,8 +557,8 @@ private fun WorkProfileStatusCard(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = if (state.isProfileOwner) {
-                    "Chế độ Profile Owner hoạt động. Ứng dụng nhân bản được cô lập hoàn toàn trong User ID riêng và đóng băng khi khóa."
+                text = if (isWorkActive) {
+                    "Không gian bảo mật Work Profile đang hoạt động. Ứng dụng nhân bản chạy hoàn toàn độc lập trong vùng chứa riêng biệt và được đóng băng khi khóa Thư mục."
                 } else {
                     "Mã hóa phần cứng AES-256-GCM hoạt động cho Vault. Để nhân bản và cách ly ứng dụng (Zalo, Telegram, Facebook), cần cấp quyền Profile Owner (Hồ sơ Công việc)."
                 },
@@ -567,7 +568,7 @@ private fun WorkProfileStatusCard(
                 )
             )
 
-            if (!state.isProfileOwner && state.provisioningState == ProvisioningState.PROVISIONING_ALLOWED) {
+            if (!isWorkActive && state.provisioningState == ProvisioningState.PROVISIONING_ALLOWED) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Button(
                     onClick = onSetupWorkProfile,

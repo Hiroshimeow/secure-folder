@@ -15,6 +15,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.camera.SecureCameraScreen
 import com.example.ui.gallery.VaultGalleryScreen
@@ -25,8 +26,6 @@ import com.example.ui.theme.SecureFolderTheme
 import com.example.viewmodel.FolderHomeViewModel
 import com.example.viewmodel.LockViewModel
 import com.example.viewmodel.VaultViewModel
-
-import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -40,6 +39,11 @@ sealed class Screen {
 }
 
 class MainActivity : FragmentActivity() {
+
+    companion object {
+        @Volatile
+        var isLaunchingSystemIntent: Boolean = false
+    }
 
     private lateinit var lockViewModel: LockViewModel
     private var lastBackgroundTimestamp: Long = 0L
@@ -58,18 +62,18 @@ class MainActivity : FragmentActivity() {
         setContent {
             SecureFolderTheme(darkTheme = true) {
                 lockViewModel = viewModel()
-                val homeViewModel: FolderHomeViewModel = viewModel()
                 val vaultViewModel: VaultViewModel = viewModel()
+                val homeViewModel: FolderHomeViewModel = viewModel()
 
                 val lockState by lockViewModel.uiState.collectAsState()
                 var currentScreen by remember { mutableStateOf<Screen>(Screen.Home) }
 
                 Crossfade(
                     targetState = lockState.isLocked,
-                    animationSpec = tween(durationMillis = 300),
+                    animationSpec = tween(350),
                     label = "LockTransition"
-                ) { isLocked ->
-                    if (isLocked) {
+                ) { locked ->
+                    if (locked) {
                         LockScreen(
                             viewModel = lockViewModel,
                             modifier = Modifier.fillMaxSize()
@@ -129,9 +133,13 @@ class MainActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // If returning from system file picker or system intent, reset transient flag
+        val wasSystemIntent = isLaunchingSystemIntent
+        isLaunchingSystemIntent = false
+
         // P1.04: Check timeout auto-lock policy when returning to foreground
         val settings = SecureFolderApp.instance.settingsRepository.settings.value
-        if (settings.autoLockTimeoutMinutes > 0 && lastBackgroundTimestamp > 0L) {
+        if (!wasSystemIntent && settings.autoLockTimeoutMinutes > 0 && lastBackgroundTimestamp > 0L) {
             val elapsedMillis = System.currentTimeMillis() - lastBackgroundTimestamp
             val thresholdMillis = settings.autoLockTimeoutMinutes * 60 * 1000L
             if (elapsedMillis >= thresholdMillis) {
@@ -145,6 +153,13 @@ class MainActivity : FragmentActivity() {
     override fun onStop() {
         super.onStop()
         lastBackgroundTimestamp = System.currentTimeMillis()
+
+        // If the Activity stopped because of an intentional system dialog (e.g. OpenDocument or OS delete consent),
+        // DO NOT kill the authenticated session! Otherwise the session dies before callback arrives.
+        if (isLaunchingSystemIntent) {
+            return
+        }
+
         val settings = SecureFolderApp.instance.settingsRepository.settings.value
         if (settings.autoLockTimeoutMinutes == 0) {
             if (::lockViewModel.isInitialized) {
