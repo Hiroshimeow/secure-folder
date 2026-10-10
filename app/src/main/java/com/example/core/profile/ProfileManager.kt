@@ -8,7 +8,6 @@ import android.content.pm.LauncherActivityInfo
 import android.content.pm.LauncherApps
 import android.graphics.Rect
 import android.os.Build
-import android.os.Process
 import android.os.UserHandle
 import android.os.UserManager
 import android.util.Log
@@ -16,9 +15,12 @@ import com.example.admin.ProvisioningManager
 import com.example.admin.SecureFolderAdminReceiver
 
 /**
- * Core Engine for Profile Lockdown, Process Freezing, and App Sandboxing.
- * Interacts directly with DevicePolicyManager, LauncherApps, and UserManager.
- * Enforces zero-fake clone results and strict isolation bounds.
+ * Profile management engine.
+ * Responsibilities:
+ * - Quiet mode freezing / unfreezing of the managed profile.
+ * - Deduplicated querying of host and managed-profile activities.
+ * - Profile-aware launching strictly targeting the managed profile (fail-closed).
+ * - Guarding Profile-Owner-only DPM APIs so Personal Controller does not invoke them illegally.
  */
 class ProfileManager(
     private val context: Context,
@@ -35,12 +37,12 @@ class ProfileManager(
     private val adminComponent = SecureFolderAdminReceiver.getComponentName(context)
 
     /**
-     * Toggles Profile Enabled / Frozen State.
+     * Toggles quiet mode / freezing of the Work Profile.
      * When locking:
-     * - Freezes background processes and suppresses notifications using Android Work Profile Quiet Mode
-     * - Or issues DPC lockNow() if Profile Owner
+     * - Enables quiet mode on the managed profile to freeze processes and suppress notifications.
      * When unlocking:
-     * - Wakes up and unfreezes Work Profile processes
+     * - Disables quiet mode to resume managed profile processes.
+     * Note: Profile-Owner-only lockNow() is invoked ONLY if this instance is actually Profile Owner.
      */
     fun setProfileLocked(locked: Boolean): Boolean {
         val workHandle = provisioningManager.getWorkProfileUserHandle()
@@ -52,9 +54,10 @@ class ProfileManager(
         return try {
             if (workHandle != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 userManager.requestQuietModeEnabled(locked, workHandle)
-                Log.i(TAG, "Managed profile quiet mode set to $locked")
+                Log.i(TAG, "Managed profile quiet mode requested: locked=$locked")
             }
 
+            // Only call DPM methods if the calling process is legitimately Profile Owner
             if (provisioningManager.isProfileOwner()) {
                 if (locked) {
                     try {
@@ -78,13 +81,12 @@ class ProfileManager(
     }
 
     /**
-     * Native App Cloning (P0.02 fix):
-     * Strictly verifies Profile Owner status. If not Profile Owner, returns false.
-     * Never falsely reports success.
+     * Executes installExistingPackage directly ONLY if the current process is the Profile Owner.
+     * If called in Personal Controller (User 0), it fails-closed immediately without calling DPM.
      */
     fun cloneAppIntoSecureFolder(packageName: String): Boolean {
         if (!provisioningManager.isProfileOwner()) {
-            Log.w(TAG, "Cannot clone app $packageName: Device Admin / Profile Owner is not active.")
+            Log.w(TAG, "Personal Controller cannot invoke installExistingPackage directly. Must use Managed Executor.")
             return false
         }
 
@@ -99,30 +101,15 @@ class ProfileManager(
     }
 
     /**
-     * Unclones / uninstalls app from the Managed Profile.
-     * Uses PackageInstaller session for true profile uninstallation and data wipe,
-     * along with setApplicationHidden.
+     * Executes unclone directly ONLY if the current process is the Profile Owner.
      */
     fun uncloneApp(packageName: String): Boolean {
         if (!provisioningManager.isProfileOwner()) {
-            Log.w(TAG, "Cannot unclone app $packageName: Not Profile Owner")
+            Log.w(TAG, "Personal Controller cannot invoke setApplicationHidden directly. Must use Managed Executor.")
             return false
         }
         return try {
             dpm.setApplicationHidden(adminComponent, packageName, true)
-            try {
-                val packageInstaller = context.packageManager.packageInstaller
-                val intent = Intent("com.example.UNINSTALL_STATUS")
-                val pendingIntent = android.app.PendingIntent.getBroadcast(
-                    context,
-                    0,
-                    intent,
-                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
-                )
-                packageInstaller.uninstall(packageName, pendingIntent.intentSender)
-            } catch (e: Exception) {
-                Log.w(TAG, "PackageInstaller uninstall triggered: ${e.message}")
-            }
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to hide/uninstall app $packageName in managed profile", e)
@@ -131,12 +118,15 @@ class ProfileManager(
     }
 
     /**
-     * Queries all installed launchable applications in Personal Space (User 0).
+     * Queries all installed launchable activities in Personal Space (User 0).
+     * Deduplicates by package name so multiple launcher activities do not cause duplicates.
      */
     fun getHostInstalledActivities(): List<LauncherActivityInfo> {
         return try {
             val personalHandle = provisioningManager.getPersonalUserHandle()
-            launcherApps.getActivityList(null, personalHandle)
+            val rawList = launcherApps.getActivityList(null, personalHandle)
+            // Deduplicate by package name
+            rawList.distinctBy { it.applicationInfo.packageName }
         } catch (e: Exception) {
             Log.e(TAG, "Error querying host activities", e)
             emptyList()
@@ -144,12 +134,15 @@ class ProfileManager(
     }
 
     /**
-     * Queries cloned applications inside the Secure Folder Work Profile.
+     * Queries cloned activities inside the Secure Folder Work Profile.
+     * Deduplicates by package name so multiple launcher activities from one package produce a single app row.
      */
     fun getClonedActivities(): List<LauncherActivityInfo> {
         val workHandle = provisioningManager.getWorkProfileUserHandle() ?: return emptyList()
         return try {
-            launcherApps.getActivityList(null, workHandle)
+            val rawList = launcherApps.getActivityList(null, workHandle)
+            // Deduplicate by package name
+            rawList.distinctBy { it.applicationInfo.packageName }
         } catch (e: Exception) {
             Log.e(TAG, "Error querying cloned activities", e)
             emptyList()
@@ -157,9 +150,41 @@ class ProfileManager(
     }
 
     /**
-     * Launches an application instance inside the target profile.
-     * P0.10 fix: NEVER fallback to opening in personal profile!
+     * Launches an application instance strictly in the managed profile.
+     * Fail-closed: Never falls back to personal profile (User 0)!
      */
+    fun launchAppInWorkProfile(
+        packageName: String,
+        componentClassName: String? = null,
+        sourceBounds: Rect? = null
+    ): Boolean {
+        val workHandle = provisioningManager.getWorkProfileUserHandle()
+        if (workHandle == null) {
+            Log.e(TAG, "Cannot launch app $packageName: Managed Work Profile handle is null.")
+            return false
+        }
+
+        return try {
+            val activities = launcherApps.getActivityList(packageName, workHandle)
+            if (activities.isEmpty()) {
+                Log.e(TAG, "No launchable activity found for $packageName in managed profile")
+                return false
+            }
+
+            val targetActivity = if (!componentClassName.isNullOrBlank()) {
+                activities.find { it.componentName.className == componentClassName } ?: activities.first()
+            } else {
+                activities.first()
+            }
+
+            launcherApps.startMainActivity(targetActivity.componentName, workHandle, sourceBounds, null)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to launch $packageName in isolated profile: ${e.message}", e)
+            false
+        }
+    }
+
     fun launchApp(
         componentName: ComponentName,
         userHandle: UserHandle,
@@ -169,7 +194,7 @@ class ProfileManager(
             launcherApps.startMainActivity(componentName, userHandle, sourceBounds, null)
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to launch main activity for ${componentName.packageName} in isolated profile", e)
+            Log.e(TAG, "Failed to launch main activity for ${componentName.packageName}", e)
             false
         }
     }

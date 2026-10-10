@@ -1,13 +1,10 @@
 package com.example.data.repository
 
-import android.content.ComponentName
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Rect
-import android.os.Process
-import android.os.UserHandle
 import android.util.Log
 import com.example.admin.ProvisioningManager
 import com.example.core.profile.ProfileManager
@@ -19,7 +16,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 
 /**
- * Manages Installed Host Applications and Cloned Secure Folder Applications.
+ * Manages Installed Host Applications and Cloned Workspace Applications.
+ * Ground-truth rule: Real OS Work Profile state is authoritative.
+ * SharedPreferences only caches user intent; apps are never marked cloned without OS verification.
  */
 class AppRepository(
     private val context: Context,
@@ -47,21 +46,19 @@ class AppRepository(
     }
 
     /**
-     * Loads cloned apps from persistence and Managed Profile activities.
+     * Loads cloned apps from OS Managed Profile activities.
+     * Deduplicates by package name and excludes self.
      */
     fun loadClonedApps() {
-        val savedPackages = prefs.getStringSet(KEY_CLONED_PACKAGES, emptySet()) ?: emptySet()
-        val list = mutableListOf<ClonedApp>()
-
-        // 1. Query actual Work Profile activities if provisioned
         val workActivities = profileManager.getClonedActivities()
-        val workPackages = mutableSetOf<String>()
+        val list = mutableListOf<ClonedApp>()
+        val activePackages = mutableSetOf<String>()
 
         for (activity in workActivities) {
             val pkg = activity.applicationInfo.packageName
-            // Exclude self from cloned list
             if (pkg == context.packageName) continue
-            workPackages.add(pkg)
+            if (activePackages.contains(pkg)) continue // Deduplicate by package name
+            activePackages.add(pkg)
 
             list.add(
                 ClonedApp(
@@ -75,34 +72,27 @@ class AppRepository(
             )
         }
 
-        // 2. Only if provisioned as profile owner or work profile is active, verify cloned packages
-        for (pkg in savedPackages) {
-            if (workPackages.contains(pkg) || pkg == context.packageName) continue
-            // Do not deceptively show non-work-profile apps as isolated if not in work profile
-            if (workActivities.isNotEmpty()) {
-                continue
-            }
-        }
-
+        // Keep local cache in sync with verified OS truth
+        prefs.edit().putStringSet(KEY_CLONED_PACKAGES, activePackages).apply()
         _clonedApps.value = list.sortedBy { it.appLabel }
     }
 
     /**
-     * Scans all installed apps on personal profile (User 0) that can be cloned into Secure Folder.
+     * Scans installed apps on the Personal Profile (User 0) that are available to clone.
+     * Deduplicates by package name and excludes apps already cloned.
      */
     suspend fun refreshHostApps() = withContext(Dispatchers.IO) {
         val result = mutableListOf<ClonedApp>()
         val currentCloned = _clonedApps.value.map { it.packageName }.toSet()
+        val addedPackages = mutableSetOf<String>()
 
         try {
-            // First try LauncherApps on personal user handle
-            val personalHandle = provisioningManager.getPersonalUserHandle()
             val activities = profileManager.getHostInstalledActivities()
-
             if (activities.isNotEmpty()) {
                 for (act in activities) {
                     val pkg = act.applicationInfo.packageName
-                    if (pkg == context.packageName || currentCloned.contains(pkg)) continue
+                    if (pkg == context.packageName || currentCloned.contains(pkg) || addedPackages.contains(pkg)) continue
+                    addedPackages.add(pkg)
 
                     result.add(
                         ClonedApp(
@@ -116,12 +106,13 @@ class AppRepository(
                     )
                 }
             } else {
-                // Standard package manager query fallback
+                // Fallback using package manager
                 val installed = packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
                 for (info in installed) {
                     val pkg = info.packageName
-                    if (pkg == context.packageName || currentCloned.contains(pkg)) continue
+                    if (pkg == context.packageName || currentCloned.contains(pkg) || addedPackages.contains(pkg)) continue
                     val launchIntent = packageManager.getLaunchIntentForPackage(pkg) ?: continue
+                    addedPackages.add(pkg)
 
                     result.add(
                         ClonedApp(
@@ -143,33 +134,40 @@ class AppRepository(
     }
 
     /**
-     * Clones an application into the Secure Folder using DPC installExistingPackage.
-     * P0.02 fix: Only records clone if system cloning actually succeeds!
+     * Verifies against real OS state whether a package is installed in the Managed Profile.
      */
-    suspend fun cloneApp(app: ClonedApp): Boolean = withContext(Dispatchers.IO) {
-        val success = profileManager.cloneAppIntoSecureFolder(app.packageName)
-        if (success) {
-            val currentSaved = prefs.getStringSet(KEY_CLONED_PACKAGES, emptySet())?.toMutableSet() ?: mutableSetOf()
-            currentSaved.add(app.packageName)
-            prefs.edit().putStringSet(KEY_CLONED_PACKAGES, currentSaved).apply()
-
-            loadClonedApps()
-            refreshHostApps()
-        }
-        success
+    fun isPackageInWorkProfile(packageName: String): Boolean {
+        val activities = profileManager.getClonedActivities()
+        return activities.any { it.applicationInfo.packageName == packageName }
     }
 
     /**
-     * Removes a cloned app from the Secure Folder (P1.02 fix: hides/uninstalls from profile).
+     * Verifies that the clone operation actually succeeded in OS truth before updating state.
+     * If verified: updates cloned list and refreshes host apps.
+     * If not verified: preserves app in available host list and returns false.
      */
-    suspend fun removeClonedApp(packageName: String) = withContext(Dispatchers.IO) {
-        profileManager.uncloneApp(packageName)
-        val currentSaved = prefs.getStringSet(KEY_CLONED_PACKAGES, emptySet())?.toMutableSet() ?: mutableSetOf()
-        currentSaved.remove(packageName)
-        prefs.edit().putStringSet(KEY_CLONED_PACKAGES, currentSaved).apply()
-
+    suspend fun verifyAndApplyClone(packageName: String): Boolean = withContext(Dispatchers.IO) {
         loadClonedApps()
-        refreshHostApps()
+        val verified = isPackageInWorkProfile(packageName)
+        if (verified) {
+            refreshHostApps()
+        }
+        verified
+    }
+
+    /**
+     * Verifies that the remove operation actually removed the package from OS truth.
+     * If verified: removes from cloned list and restores to host apps.
+     * If removal failed: preserves app in cloned list and returns false.
+     */
+    suspend fun verifyAndApplyRemoval(packageName: String): Boolean = withContext(Dispatchers.IO) {
+        loadClonedApps()
+        val stillExists = isPackageInWorkProfile(packageName)
+        val success = !stillExists
+        if (success) {
+            refreshHostApps()
+        }
+        success
     }
 
     /**
@@ -177,12 +175,10 @@ class AppRepository(
      * Fail-closed: Never falls back to personal profile (User 0)!
      */
     fun launchClonedApp(app: ClonedApp, bounds: Rect? = null): Boolean {
-        val workHandle = provisioningManager.getWorkProfileUserHandle()
-        if (workHandle == null) {
-            Log.e(TAG, "Cannot launch app ${app.packageName}: Managed Work Profile is not provisioned or not found.")
-            return false
-        }
-        val component = ComponentName(app.packageName, app.componentClassName)
-        return profileManager.launchApp(component, workHandle, bounds)
+        return profileManager.launchAppInWorkProfile(
+            packageName = app.packageName,
+            componentClassName = app.componentClassName,
+            sourceBounds = bounds
+        )
     }
 }

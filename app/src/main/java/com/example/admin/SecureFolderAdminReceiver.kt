@@ -5,16 +5,20 @@ import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.util.Log
+import com.example.core.profile.CrossProfileBridge
 
 /**
- * Samsung Secure Folder Device Admin Receiver.
- * Controls the Managed Profile lifecycle, lockdown, and cross-profile policies.
+ * Enterprise Profile Owner and Device Admin Receiver.
+ * Controls the Managed Profile lifecycle, cross-profile intent routing, and command execution.
  */
 class SecureFolderAdminReceiver : DeviceAdminReceiver() {
 
     companion object {
         private const val TAG = "SecureFolderAdmin"
+        const val WORKSPACE_PROFILE_NAME = "Private Workspace"
 
         fun getComponentName(context: Context): ComponentName {
             return ComponentName(context.applicationContext, SecureFolderAdminReceiver::class.java)
@@ -23,23 +27,44 @@ class SecureFolderAdminReceiver : DeviceAdminReceiver() {
 
     override fun onEnabled(context: Context, intent: Intent) {
         super.onEnabled(context, intent)
-        Log.i(TAG, "Secure Folder Device Admin Enabled")
+        Log.i(TAG, "Device Admin Enabled")
     }
 
     override fun onProfileProvisioningComplete(context: Context, intent: Intent) {
         super.onProfileProvisioningComplete(context, intent)
-        Log.i(TAG, "Secure Folder Managed Profile Provisioning Complete")
+        Log.i(TAG, "Managed Profile Provisioning Complete")
 
         val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
         val admin = getComponentName(context)
 
-        dpm?.let {
+        dpm?.let { policyManager ->
             try {
-                // Set profile name to match Samsung Secure Folder
-                it.setProfileName(admin, "Thư mục Bảo mật")
+                // Set distinct product-neutral profile name
+                policyManager.setProfileName(admin, WORKSPACE_PROFILE_NAME)
                 // Enable profile immediately
-                it.setProfileEnabled(admin)
-                Log.i(TAG, "Managed profile enabled successfully")
+                policyManager.setProfileEnabled(admin)
+
+                // Configure DPC Cross-Profile Intent Filter so Personal Controller can dispatch commands to Managed Profile
+                val filter = IntentFilter().apply {
+                    addAction(CrossProfileBridge.ACTION_EXECUTE_COMMAND)
+                    addCategory(Intent.CATEGORY_DEFAULT)
+                }
+                policyManager.addCrossProfileIntentFilter(
+                    admin,
+                    filter,
+                    DevicePolicyManager.FLAG_PARENT_CAN_ACCESS_MANAGED
+                )
+
+                // Allow this package to interact across profiles without restriction (Android 11+)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    try {
+                        policyManager.setCrossProfilePackages(admin, setOf(context.packageName))
+                    } catch (e: Exception) {
+                        Log.w(TAG, "setCrossProfilePackages: ${e.message}")
+                    }
+                }
+
+                Log.i(TAG, "Private Workspace profile configured and cross-profile intent filter installed")
             } catch (e: Exception) {
                 Log.e(TAG, "Error configuring managed profile on provisioning complete", e)
             }
@@ -48,6 +73,6 @@ class SecureFolderAdminReceiver : DeviceAdminReceiver() {
 
     override fun onDisabled(context: Context, intent: Intent) {
         super.onDisabled(context, intent)
-        Log.i(TAG, "Secure Folder Device Admin Disabled")
+        Log.i(TAG, "Device Admin Disabled")
     }
 }

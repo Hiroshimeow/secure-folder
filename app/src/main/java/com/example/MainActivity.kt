@@ -1,6 +1,8 @@
 package com.example
 
+import android.content.Context
 import android.os.Bundle
+import android.os.UserManager
 import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -20,6 +22,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.camera.SecureCameraScreen
 import com.example.ui.gallery.VaultGalleryScreen
 import com.example.ui.home.FolderHomeScreen
+import com.example.ui.home.ManagedExecutorScreen
 import com.example.ui.lock.LockScreen
 import com.example.ui.settings.SettingsScreen
 import com.example.ui.theme.SecureFolderTheme
@@ -38,20 +41,52 @@ sealed class Screen {
     data object Settings : Screen()
 }
 
+/**
+ * Bounded lease manager for system dialog flows (Document Picker, Photo Picker, Camera).
+ * Guarantees that system round-trips do not kill the session prematurely while preventing
+ * permanent unauthenticated leaks through an automatic 60-second time bound.
+ */
+object ExternalSystemFlowLease {
+    @Volatile
+    private var leaseExpiryTime: Long = 0L
+
+    fun acquireLease(durationMillis: Long = 60_000L) {
+        leaseExpiryTime = System.currentTimeMillis() + durationMillis
+    }
+
+    fun releaseLease() {
+        leaseExpiryTime = 0L
+    }
+
+    val isLeaseActive: Boolean
+        get() = System.currentTimeMillis() < leaseExpiryTime
+}
+
 class MainActivity : FragmentActivity() {
 
     companion object {
-        @Volatile
-        var isLaunchingSystemIntent: Boolean = false
+        /**
+         * Backward-compatible property backed by a bounded lease.
+         */
+        var isLaunchingSystemIntent: Boolean
+            get() = ExternalSystemFlowLease.isLeaseActive
+            set(value) {
+                if (value) {
+                    ExternalSystemFlowLease.acquireLease(60_000L)
+                } else {
+                    ExternalSystemFlowLease.releaseLease()
+                }
+            }
     }
 
     private lateinit var lockViewModel: LockViewModel
+    private lateinit var homeViewModel: FolderHomeViewModel
     private var lastBackgroundTimestamp: Long = 0L
     private var backgroundLockJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // P1.06: Enforce FLAG_SECURE to prevent screenshots, screen recording, and task switcher leaks
+        // Enforce FLAG_SECURE to prevent screenshots, screen recording, and task switcher leaks
         window.setFlags(
             WindowManager.LayoutParams.FLAG_SECURE,
             WindowManager.LayoutParams.FLAG_SECURE
@@ -59,64 +94,74 @@ class MainActivity : FragmentActivity() {
 
         enableEdgeToEdge()
 
+        val userManager = getSystemService(Context.USER_SERVICE) as UserManager
+        val isManagedProfile = userManager.isManagedProfile
+
         setContent {
             SecureFolderTheme(darkTheme = true) {
-                lockViewModel = viewModel()
-                val vaultViewModel: VaultViewModel = viewModel()
-                val homeViewModel: FolderHomeViewModel = viewModel()
+                if (isManagedProfile) {
+                    // P1: Managed Profile is strictly an execution container.
+                    // Render minimal executor UI, no Vault PIN or user data UI.
+                    ManagedExecutorScreen(modifier = Modifier.fillMaxSize())
+                } else {
+                    // Personal Controller: Full Secure Folder Vault Experience
+                    lockViewModel = viewModel()
+                    val vaultViewModel: VaultViewModel = viewModel()
+                    homeViewModel = viewModel()
 
-                val lockState by lockViewModel.uiState.collectAsState()
-                var currentScreen by remember { mutableStateOf<Screen>(Screen.Home) }
+                    val lockState by lockViewModel.uiState.collectAsState()
+                    var currentScreen by remember { mutableStateOf<Screen>(Screen.Home) }
 
-                Crossfade(
-                    targetState = lockState.isLocked,
-                    animationSpec = tween(350),
-                    label = "LockTransition"
-                ) { locked ->
-                    if (locked) {
-                        LockScreen(
-                            viewModel = lockViewModel,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        when (val screen = currentScreen) {
-                            is Screen.Home -> {
-                                FolderHomeScreen(
-                                    viewModel = homeViewModel,
-                                    onOpenVault = { filter ->
-                                        currentScreen = Screen.Vault(filter)
-                                    },
-                                    onOpenCamera = {
-                                        currentScreen = Screen.Camera
-                                    },
-                                    onOpenSettings = {
-                                        currentScreen = Screen.Settings
-                                    },
-                                    onLockFolder = {
-                                        lockViewModel.lockVault()
-                                    },
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            }
-                            is Screen.Vault -> {
-                                VaultGalleryScreen(
-                                    viewModel = vaultViewModel,
-                                    initialFilter = screen.filterType,
-                                    onBack = { currentScreen = Screen.Home },
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            }
-                            is Screen.Camera -> {
-                                SecureCameraScreen(
-                                    onBack = { currentScreen = Screen.Home },
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            }
-                            is Screen.Settings -> {
-                                SettingsScreen(
-                                    onBack = { currentScreen = Screen.Home },
-                                    modifier = Modifier.fillMaxSize()
-                                )
+                    Crossfade(
+                        targetState = lockState.isLocked,
+                        animationSpec = tween(350),
+                        label = "LockTransition"
+                    ) { locked ->
+                        if (locked) {
+                            LockScreen(
+                                viewModel = lockViewModel,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            when (val screen = currentScreen) {
+                                is Screen.Home -> {
+                                    FolderHomeScreen(
+                                        viewModel = homeViewModel,
+                                        onOpenVault = { filter ->
+                                            currentScreen = Screen.Vault(filter)
+                                        },
+                                        onOpenCamera = {
+                                            currentScreen = Screen.Camera
+                                        },
+                                        onOpenSettings = {
+                                            currentScreen = Screen.Settings
+                                        },
+                                        onLockFolder = {
+                                            lockViewModel.lockVault()
+                                        },
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                                is Screen.Vault -> {
+                                    VaultGalleryScreen(
+                                        viewModel = vaultViewModel,
+                                        initialFilter = screen.filterType,
+                                        onBack = { currentScreen = Screen.Home },
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                                is Screen.Camera -> {
+                                    SecureCameraScreen(
+                                        onBack = { currentScreen = Screen.Home },
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                                is Screen.Settings -> {
+                                    SettingsScreen(
+                                        onBack = { currentScreen = Screen.Home },
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
                             }
                         }
                     }
@@ -133,11 +178,15 @@ class MainActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // If returning from system file picker or system intent, reset transient flag
-        val wasSystemIntent = isLaunchingSystemIntent
-        isLaunchingSystemIntent = false
+        val wasSystemIntent = ExternalSystemFlowLease.isLeaseActive
+        // Release lease upon returning to foreground
+        ExternalSystemFlowLease.releaseLease()
 
-        // P1.04: Check timeout auto-lock policy when returning to foreground
+        if (::homeViewModel.isInitialized) {
+            homeViewModel.checkProfileStatus()
+        }
+
+        // Check timeout auto-lock policy when returning to foreground
         val settings = SecureFolderApp.instance.settingsRepository.settings.value
         if (!wasSystemIntent && settings.autoLockTimeoutMinutes > 0 && lastBackgroundTimestamp > 0L) {
             val elapsedMillis = System.currentTimeMillis() - lastBackgroundTimestamp
@@ -154,9 +203,9 @@ class MainActivity : FragmentActivity() {
         super.onStop()
         lastBackgroundTimestamp = System.currentTimeMillis()
 
-        // If the Activity stopped because of an intentional system dialog (e.g. OpenDocument or OS delete consent),
-        // DO NOT kill the authenticated session! Otherwise the session dies before callback arrives.
-        if (isLaunchingSystemIntent) {
+        // If the Activity stopped because of a bounded system flow (e.g. system file picker or photo picker),
+        // DO NOT kill the authenticated session before the callback arrives!
+        if (ExternalSystemFlowLease.isLeaseActive) {
             return
         }
 

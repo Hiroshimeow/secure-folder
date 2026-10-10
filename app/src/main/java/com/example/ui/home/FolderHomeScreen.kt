@@ -1,6 +1,6 @@
 package com.example.ui.home
 
-import android.content.Context
+import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
@@ -11,14 +11,12 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -38,19 +36,21 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.NoteAlt
+import androidx.compose.material.icons.filled.PauseCircle
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -89,7 +89,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.admin.ProvisioningState
+import com.example.core.profile.CrossProfileBridge
+import com.example.core.profile.PackageOpState
+import com.example.core.profile.WorkspaceState
 import com.example.data.model.ClonedApp
 import com.example.ui.theme.OneUiDarkBackground
 import com.example.ui.theme.OneUiDarkBorder
@@ -123,10 +125,41 @@ fun FolderHomeScreen(
     var showMenu by remember { mutableStateOf(false) }
     var selectedAppForMenu by remember { mutableStateOf<ClonedApp?>(null) }
 
+    // Launcher for Managed Profile Provisioning
     val provisioningLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
         viewModel.checkProfileStatus()
+    }
+
+    // Launcher for Cross-Profile Command Execution (CLONE)
+    val cloneCommandLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        val targetPkg = data?.getStringExtra(CrossProfileBridge.EXTRA_TARGET_PACKAGE)
+        val success = result.resultCode == Activity.RESULT_OK &&
+                data?.getBooleanExtra(CrossProfileBridge.EXTRA_RESULT_SUCCESS, false) == true
+        val errorMsg = data?.getStringExtra(CrossProfileBridge.EXTRA_ERROR_MESSAGE)
+
+        if (!targetPkg.isNullOrBlank()) {
+            viewModel.onCloneCommandResult(targetPkg, success, errorMsg)
+        }
+    }
+
+    // Launcher for Cross-Profile Command Execution (REMOVE)
+    val removeCommandLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        val targetPkg = data?.getStringExtra(CrossProfileBridge.EXTRA_TARGET_PACKAGE)
+        val success = result.resultCode == Activity.RESULT_OK &&
+                data?.getBooleanExtra(CrossProfileBridge.EXTRA_RESULT_SUCCESS, false) == true
+        val errorMsg = data?.getStringExtra(CrossProfileBridge.EXTRA_ERROR_MESSAGE)
+
+        if (!targetPkg.isNullOrBlank()) {
+            viewModel.onRemoveCommandResult(targetPkg, success, errorMsg)
+        }
     }
 
     LaunchedEffect(state.statusMessage) {
@@ -266,6 +299,9 @@ fun FolderHomeScreen(
                                 snackbarHostState.showSnackbar("Thiết bị chưa hỗ trợ kích hoạt hồ sơ tự động.")
                             }
                         }
+                    },
+                    onRefreshProfile = {
+                        viewModel.checkProfileStatus()
                     }
                 )
             }
@@ -400,7 +436,9 @@ fun FolderHomeScreen(
                                 onClick = { viewModel.openAddAppSheet() },
                                 colors = ButtonDefaults.buttonColors(containerColor = OneUiTealPrimary),
                                 shape = RoundedCornerShape(14.dp),
-                                modifier = Modifier.fillMaxWidth(0.85f).testTag("empty_state_add_button")
+                                modifier = Modifier
+                                    .fillMaxWidth(0.85f)
+                                    .testTag("empty_state_add_button")
                             ) {
                                 Icon(Icons.Default.Add, contentDescription = null, tint = Color.White)
                                 Spacer(modifier = Modifier.width(8.dp))
@@ -426,12 +464,14 @@ fun FolderHomeScreen(
                                 ) {
                                     val quickList = state.availableHostApps.take(3)
                                     for (app in quickList) {
+                                        val opStatus = state.packageStatuses[app.packageName]?.state
+                                        val isOperating = opStatus == PackageOpState.CLONING
+
                                         Row(
                                             modifier = Modifier
                                                 .fillMaxWidth()
                                                 .clip(RoundedCornerShape(12.dp))
                                                 .background(OneUiDarkSurface)
-                                                .clickable { viewModel.cloneApp(app) }
                                                 .padding(horizontal = 12.dp, vertical = 8.dp),
                                             verticalAlignment = Alignment.CenterVertically,
                                             horizontalArrangement = Arrangement.SpaceBetween
@@ -447,7 +487,9 @@ fun FolderHomeScreen(
                                                     Image(
                                                         bitmap = bitmap.asImageBitmap(),
                                                         contentDescription = null,
-                                                        modifier = Modifier.size(32.dp).clip(RoundedCornerShape(8.dp))
+                                                        modifier = Modifier
+                                                            .size(32.dp)
+                                                            .clip(RoundedCornerShape(8.dp))
                                                     )
                                                 } else {
                                                     Icon(
@@ -467,12 +509,25 @@ fun FolderHomeScreen(
                                                 )
                                             }
                                             Button(
-                                                onClick = { viewModel.cloneApp(app) },
+                                                onClick = {
+                                                    viewModel.requestClone(app) { intent ->
+                                                        cloneCommandLauncher.launch(intent)
+                                                    }
+                                                },
+                                                enabled = !isOperating,
                                                 colors = ButtonDefaults.buttonColors(containerColor = OneUiTealPrimary.copy(alpha = 0.2f)),
                                                 shape = RoundedCornerShape(8.dp),
                                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
                                             ) {
-                                                Text("Nhân bản", color = OneUiTealBright, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                                if (isOperating) {
+                                                    CircularProgressIndicator(
+                                                        modifier = Modifier.size(14.dp),
+                                                        strokeWidth = 2.dp,
+                                                        color = OneUiTealBright
+                                                    )
+                                                } else {
+                                                    Text("Nhân bản", color = OneUiTealBright, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                                }
                                             }
                                         }
                                     }
@@ -505,7 +560,9 @@ fun FolderHomeScreen(
             },
             onRemove = {
                 selectedAppForMenu = null
-                viewModel.removeClonedApp(app.packageName)
+                viewModel.requestRemove(app) { intent ->
+                    removeCommandLauncher.launch(intent)
+                }
             }
         )
     }
@@ -514,17 +571,25 @@ fun FolderHomeScreen(
     if (state.isAddAppSheetOpen) {
         AddAppBottomSheet(
             viewModel = viewModel,
-            onDismiss = { viewModel.closeAddAppSheet() }
+            onDismiss = { viewModel.closeAddAppSheet() },
+            onLaunchCloneIntent = { intent ->
+                cloneCommandLauncher.launch(intent)
+            }
         )
     }
 }
 
+/**
+ * P1 UX: Clean, semantic Work Profile status component.
+ * Clear states: NOT_PROVISIONED, READY, PAUSED, ERROR.
+ */
 @Composable
 private fun WorkProfileStatusCard(
     state: com.example.viewmodel.HomeUiState,
-    onSetupWorkProfile: () -> Unit
+    onSetupWorkProfile: () -> Unit,
+    onRefreshProfile: () -> Unit
 ) {
-    val isWorkActive = state.isWorkProfileActive || state.isProfileOwner
+    val workspaceState = state.workspaceState
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -534,49 +599,201 @@ private fun WorkProfileStatusCard(
         border = androidx.compose.foundation.BorderStroke(1.dp, OneUiDarkBorder)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                val icon = if (isWorkActive) Icons.Default.CheckCircle else Icons.Default.Info
-                val iconTint = if (isWorkActive) OneUiTealBright else OneUiShieldGold
-                Icon(
-                    imageVector = icon,
-                    contentDescription = null,
-                    tint = iconTint,
-                    modifier = Modifier.size(22.dp)
-                )
-                Spacer(modifier = Modifier.width(10.dp))
-                Text(
-                    text = if (isWorkActive) "Hồ sơ Cách ly Android Enterprise (Hoạt động)" else "Không gian Ứng dụng Riêng tư",
-                    style = MaterialTheme.typography.titleMedium.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = OneUiDarkTextPrimary,
-                        fontSize = 15.sp
+            when (workspaceState) {
+                WorkspaceState.READY -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.CheckCircle,
+                            contentDescription = null,
+                            tint = OneUiTealBright,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "Private Workspace",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = OneUiDarkTextPrimary,
+                                    fontSize = 15.sp
+                                )
+                            )
+                            Text(
+                                text = "Ready · Apps isolated in Work Profile",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = OneUiTealBright,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Không gian bảo mật đang hoạt động. Ứng dụng nhân bản được cô lập hoàn toàn dưới Android Enterprise và tự động đóng băng khi khóa Thư mục.",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = OneUiDarkTextSecondary,
+                            lineHeight = 18.sp
+                        )
                     )
-                )
-            }
+                }
 
-            Spacer(modifier = Modifier.height(8.dp))
+                WorkspaceState.NOT_PROVISIONED -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Info,
+                            contentDescription = null,
+                            tint = OneUiShieldGold,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "Private Workspace",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = OneUiDarkTextPrimary,
+                                    fontSize = 15.sp
+                                )
+                            )
+                            Text(
+                                text = "Not configured",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = OneUiShieldGold,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Vault mã hóa dữ liệu cục bộ hoạt động bình thường. Để nhân bản và cách ly các ứng dụng khác, cần thiết lập Private Workspace.",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = OneUiDarkTextSecondary,
+                            lineHeight = 18.sp
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = onSetupWorkProfile,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = OneUiTealPrimary),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("setup_workspace_button")
+                    ) {
+                        Text("Set up Private Workspace", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                }
 
-            Text(
-                text = if (isWorkActive) {
-                    "Không gian bảo mật Work Profile đang hoạt động. Ứng dụng nhân bản chạy hoàn toàn độc lập trong vùng chứa riêng biệt và được đóng băng khi khóa Thư mục."
-                } else {
-                    "Mã hóa phần cứng AES-256-GCM hoạt động cho Vault. Để nhân bản và cách ly ứng dụng (Zalo, Telegram, Facebook), cần cấp quyền Profile Owner (Hồ sơ Công việc)."
-                },
-                style = MaterialTheme.typography.bodySmall.copy(
-                    color = OneUiDarkTextSecondary,
-                    lineHeight = 18.sp
-                )
-            )
+                WorkspaceState.PAUSED -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.PauseCircle,
+                            contentDescription = null,
+                            tint = OneUiShieldGold,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "Private Workspace",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = OneUiDarkTextPrimary,
+                                    fontSize = 15.sp
+                                )
+                            )
+                            Text(
+                                text = "Paused",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = OneUiShieldGold,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Không gian làm việc đang trong chế độ tạm dừng. Các ứng dụng nhân bản đã được đóng băng tiến trình nền.",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = OneUiDarkTextSecondary,
+                            lineHeight = 18.sp
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Button(
+                        onClick = onRefreshProfile,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = OneUiShieldGold.copy(alpha = 0.2f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Resume Workspace", color = OneUiShieldGold, fontWeight = FontWeight.Bold)
+                    }
+                }
 
-            if (!isWorkActive && state.provisioningState == ProvisioningState.PROVISIONING_ALLOWED) {
-                Spacer(modifier = Modifier.height(12.dp))
-                Button(
-                    onClick = onSetupWorkProfile,
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = OneUiTealPrimary),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Kích hoạt Android Enterprise Work Profile", color = Color.White)
+                WorkspaceState.EXECUTOR_UNREACHABLE, WorkspaceState.ERROR -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.ErrorOutline,
+                            contentDescription = null,
+                            tint = OneUiLockRed,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "Private Workspace",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = OneUiDarkTextPrimary,
+                                    fontSize = 15.sp
+                                )
+                            )
+                            Text(
+                                text = "Connection problem",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = OneUiLockRed,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Không thể kết nối với executor trong Work Profile.",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = OneUiDarkTextSecondary,
+                            lineHeight = 18.sp
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Button(
+                        onClick = onRefreshProfile,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = OneUiLockRed.copy(alpha = 0.2f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Retry", color = OneUiLockRed, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                WorkspaceState.PROVISIONING -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = OneUiTealBright
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "Đang thiết lập Private Workspace...",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = OneUiDarkTextPrimary,
+                                fontSize = 15.sp
+                            )
+                        )
+                    }
                 }
             }
         }
@@ -673,7 +890,7 @@ private fun ClonedAppItem(
                 }
             }
 
-            // Samsung Knox Folder Badge on bottom right of the icon
+            // Private Workspace Badge on bottom right of the icon
             Box(
                 modifier = Modifier
                     .size(20.dp)
@@ -685,7 +902,7 @@ private fun ClonedAppItem(
             ) {
                 Icon(
                     imageVector = Icons.Default.Security,
-                    contentDescription = "Knox Protected",
+                    contentDescription = "Workspace Protected",
                     tint = Color.White,
                     modifier = Modifier.size(11.dp)
                 )
@@ -750,7 +967,7 @@ private fun AppOptionsBottomSheet(
                 shape = RoundedCornerShape(14.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Mở ứng dụng an toàn", color = Color.White)
+                Text("Mở ứng dụng trong Private Workspace", color = Color.White)
             }
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -761,7 +978,7 @@ private fun AppOptionsBottomSheet(
                 shape = RoundedCornerShape(14.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Gỡ khỏi Thư mục Bảo mật", color = OneUiLockRed)
+                Text("Gỡ khỏi Private Workspace", color = OneUiLockRed)
             }
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -769,11 +986,18 @@ private fun AppOptionsBottomSheet(
     }
 }
 
+/**
+ * P1 UX: Enhanced Add App Modal Bottom Sheet.
+ * - Single interaction target per row (only button triggers action).
+ * - Per-package state: AVAILABLE, CLONING (spinner), CLONED (checkmark), FAILED (error message & retry).
+ * - Does not close bottom sheet until outcome is determined.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AddAppBottomSheet(
     viewModel: FolderHomeViewModel,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onLaunchCloneIntent: (android.content.Intent) -> Unit
 ) {
     val state by viewModel.uiState.collectAsState()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -800,14 +1024,14 @@ private fun AddAppBottomSheet(
                 .padding(horizontal = 20.dp, vertical = 8.dp)
         ) {
             Text(
-                text = "Thêm ứng dụng vào Thư mục Bảo mật",
+                text = "Thêm ứng dụng vào Private Workspace",
                 style = MaterialTheme.typography.titleLarge.copy(
                     fontWeight = FontWeight.Bold,
                     color = OneUiDarkTextPrimary
                 )
             )
             Text(
-                text = "Ứng dụng sẽ được nhân bản và chạy riêng biệt với tài khoản độc lập.",
+                text = "Ứng dụng sẽ được nhân bản và chạy trong không gian Work Profile độc lập.",
                 style = MaterialTheme.typography.bodySmall.copy(
                     color = OneUiDarkTextSecondary
                 )
@@ -855,12 +1079,15 @@ private fun AddAppBottomSheet(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items(filteredApps, key = { it.packageName }) { app ->
+                        val packageStatus = state.packageStatuses[app.packageName]
+                        val opState = packageStatus?.state ?: PackageOpState.AVAILABLE
+                        val isOperating = opState == PackageOpState.CLONING
+
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(16.dp))
                                 .background(OneUiDarkCard)
-                                .clickable { viewModel.cloneApp(app) }
                                 .padding(12.dp)
                                 .testTag("add_item_${app.packageName}"),
                             verticalAlignment = Alignment.CenterVertically
@@ -912,16 +1139,84 @@ private fun AddAppBottomSheet(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
+                                if (packageStatus?.message != null) {
+                                    val msgColor = if (opState == PackageOpState.FAILED) OneUiLockRed else OneUiTealBright
+                                    Text(
+                                        text = packageStatus.message,
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = msgColor
+                                        ),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
 
                             Spacer(modifier = Modifier.width(8.dp))
 
-                            Button(
-                                onClick = { viewModel.cloneApp(app) },
-                                shape = RoundedCornerShape(12.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = OneUiTealPrimary)
-                            ) {
-                                Text("Thêm", color = Color.White)
+                            // One single interactive target per row
+                            when (opState) {
+                                PackageOpState.CLONING -> {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(horizontal = 8.dp)
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(18.dp),
+                                            strokeWidth = 2.dp,
+                                            color = OneUiTealBright
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "Adding...",
+                                            color = OneUiDarkTextSecondary,
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                                PackageOpState.CLONED -> {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(horizontal = 8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.CheckCircle,
+                                            contentDescription = null,
+                                            tint = OneUiTealBright,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = "Added",
+                                            color = OneUiTealBright,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                                PackageOpState.FAILED -> {
+                                    Button(
+                                        onClick = {
+                                            viewModel.requestClone(app, onLaunchCloneIntent)
+                                        },
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = OneUiLockRed.copy(alpha = 0.2f))
+                                    ) {
+                                        Text("Retry", color = OneUiLockRed, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                                else -> {
+                                    Button(
+                                        onClick = {
+                                            viewModel.requestClone(app, onLaunchCloneIntent)
+                                        },
+                                        enabled = !isOperating,
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = OneUiTealPrimary)
+                                    ) {
+                                        Text("Thêm", color = Color.White)
+                                    }
+                                }
                             }
                         }
                     }
