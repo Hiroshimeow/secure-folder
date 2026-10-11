@@ -2,8 +2,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <permission
+        android:name="com.aistudio.securefolder.knoxsf.permission.MANAGE_WORKSPACE"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.aistudio.securefolder.knoxsf.permission.MANAGE_WORKSPACE" />
+
     <!-- Enterprise Managed Profile & Device Admin Permissions -->
     <uses-permission android:name="android.permission.INTERACT_ACROSS_PROFILES" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -42,12 +49,34 @@
             android:name=".core.profile.ManagedExecutorActivity"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:permission="com.aistudio.securefolder.knoxsf.permission.MANAGE_WORKSPACE"
             android:exported="true">
             <intent-filter>
                 <action android:name="com.example.action.EXECUTE_COMMAND" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <!-- Temporary, URI-granted APK staging for cross-profile clone installation. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.clonefiles"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/clone_file_paths" />
+        </provider>
+
+        <!-- Re-apply idempotent Work Profile policy after APK upgrades in each user. -->
+        <receiver
+            android:name=".admin.WorkspaceMigrationReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Device Admin Receiver for Managed Profile Provisioning -->
         <receiver

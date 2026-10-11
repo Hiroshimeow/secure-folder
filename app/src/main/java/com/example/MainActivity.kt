@@ -1,6 +1,9 @@
 package com.example
 
+import android.content.ComponentName
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.UserManager
 import android.view.WindowManager
@@ -19,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.core.profile.ManagedExecutorActivity
 import com.example.ui.camera.SecureCameraScreen
 import com.example.ui.gallery.VaultGalleryScreen
 import com.example.ui.home.FolderHomeScreen
@@ -95,7 +99,33 @@ class MainActivity : FragmentActivity() {
         enableEdgeToEdge()
 
         val userManager = getSystemService(Context.USER_SERVICE) as UserManager
-        val isManagedProfile = userManager.isManagedProfile
+        val isManagedProfile = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && userManager.isManagedProfile
+        val isUnsupportedSecondaryProfile =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && userManager.isProfile && !isManagedProfile
+
+        // Component enablement is per-user. Keep the command executor unavailable in Personal/Dual-App
+        // profiles so implicit cross-profile commands cannot resolve back into the caller user.
+        val executorComponent = ComponentName(this, ManagedExecutorActivity::class.java)
+        packageManager.setComponentEnabledSetting(
+            executorComponent,
+            if (isManagedProfile) {
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+            } else {
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+            },
+            PackageManager.DONT_KILL_APP
+        )
+
+        // The product has exactly two supported runtimes: personal controller and managed executor.
+        // Samsung Dual Messenger / clone profiles must never become a second Vault controller.
+        if (isUnsupportedSecondaryProfile) {
+            finish()
+            return
+        }
+
+        if (isManagedProfile) {
+            SecureFolderApp.instance.provisioningManager.ensureManagedProfileConfiguration()
+        }
 
         setContent {
             SecureFolderTheme(darkTheme = true) {

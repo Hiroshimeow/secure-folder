@@ -1,16 +1,19 @@
 package com.example.ui.home
 
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -89,7 +92,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.core.profile.CrossProfileBridge
+import com.example.core.profile.CrossProfileDispatchState
 import com.example.core.profile.PackageOpState
 import com.example.core.profile.WorkspaceState
 import com.example.data.model.ClonedApp
@@ -132,33 +135,50 @@ fun FolderHomeScreen(
         viewModel.checkProfileStatus()
     }
 
-    // Launcher for Cross-Profile Command Execution (CLONE)
-    val cloneCommandLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val data = result.data
-        val targetPkg = data?.getStringExtra(CrossProfileBridge.EXTRA_TARGET_PACKAGE)
-        val success = result.resultCode == Activity.RESULT_OK &&
-                data?.getBooleanExtra(CrossProfileBridge.EXTRA_RESULT_SUCCESS, false) == true
-        val errorMsg = data?.getStringExtra(CrossProfileBridge.EXTRA_ERROR_MESSAGE)
+    var pendingCrossProfileIntent by remember { mutableStateOf<Intent?>(null) }
 
-        if (!targetPkg.isNullOrBlank()) {
-            viewModel.onCloneCommandResult(targetPkg, success, errorMsg)
+    val crossProfileConsentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        val pending = pendingCrossProfileIntent ?: return@rememberLauncherForActivityResult
+        val result = viewModel.dispatchCrossProfileCommand(context as Activity, pending)
+        when (result.state) {
+            CrossProfileDispatchState.DISPATCHED -> {
+                pendingCrossProfileIntent = null
+            }
+            CrossProfileDispatchState.CONSENT_REQUIRED -> {
+                pendingCrossProfileIntent = null
+                viewModel.onCrossProfileDispatchFailure(
+                    pending,
+                    "Chưa cấp quyền kết nối giữa Personal và Private Workspace"
+                )
+            }
+            CrossProfileDispatchState.UNAVAILABLE -> {
+                pendingCrossProfileIntent = null
+                viewModel.onCrossProfileDispatchFailure(pending, result.errorMessage)
+            }
         }
     }
 
-    // Launcher for Cross-Profile Command Execution (REMOVE)
-    val removeCommandLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val data = result.data
-        val targetPkg = data?.getStringExtra(CrossProfileBridge.EXTRA_TARGET_PACKAGE)
-        val success = result.resultCode == Activity.RESULT_OK &&
-                data?.getBooleanExtra(CrossProfileBridge.EXTRA_RESULT_SUCCESS, false) == true
-        val errorMsg = data?.getStringExtra(CrossProfileBridge.EXTRA_ERROR_MESSAGE)
-
-        if (!targetPkg.isNullOrBlank()) {
-            viewModel.onRemoveCommandResult(targetPkg, success, errorMsg)
+    val dispatchCrossProfileCommand: (Intent) -> Unit = { commandIntent ->
+        val result = viewModel.dispatchCrossProfileCommand(context as Activity, commandIntent)
+        when (result.state) {
+            CrossProfileDispatchState.DISPATCHED -> Unit
+            CrossProfileDispatchState.CONSENT_REQUIRED -> {
+                val consentIntent = result.consentIntent
+                if (consentIntent != null) {
+                    pendingCrossProfileIntent = commandIntent
+                    crossProfileConsentLauncher.launch(consentIntent)
+                } else {
+                    viewModel.onCrossProfileDispatchFailure(
+                        commandIntent,
+                        "Không thể mở cài đặt quyền cross-profile"
+                    )
+                }
+            }
+            CrossProfileDispatchState.UNAVAILABLE -> {
+                viewModel.onCrossProfileDispatchFailure(commandIntent, result.errorMessage)
+            }
         }
     }
 
@@ -510,9 +530,7 @@ fun FolderHomeScreen(
                                             }
                                             Button(
                                                 onClick = {
-                                                    viewModel.requestClone(app) { intent ->
-                                                        cloneCommandLauncher.launch(intent)
-                                                    }
+                                                    viewModel.requestClone(app, dispatchCrossProfileCommand)
                                                 },
                                                 enabled = !isOperating,
                                                 colors = ButtonDefaults.buttonColors(containerColor = OneUiTealPrimary.copy(alpha = 0.2f)),
@@ -560,9 +578,7 @@ fun FolderHomeScreen(
             },
             onRemove = {
                 selectedAppForMenu = null
-                viewModel.requestRemove(app) { intent ->
-                    removeCommandLauncher.launch(intent)
-                }
+                viewModel.requestRemove(app, dispatchCrossProfileCommand)
             }
         )
     }
@@ -572,9 +588,7 @@ fun FolderHomeScreen(
         AddAppBottomSheet(
             viewModel = viewModel,
             onDismiss = { viewModel.closeAddAppSheet() },
-            onLaunchCloneIntent = { intent ->
-                cloneCommandLauncher.launch(intent)
-            }
+            onLaunchCloneIntent = dispatchCrossProfileCommand
         )
     }
 }
@@ -843,6 +857,7 @@ private fun BuiltInAppItem(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ClonedAppItem(
     app: ClonedApp,
@@ -857,7 +872,10 @@ private fun ClonedAppItem(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
             .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
             .padding(4.dp)
             .testTag("cloned_app_${app.packageName}")
     ) {

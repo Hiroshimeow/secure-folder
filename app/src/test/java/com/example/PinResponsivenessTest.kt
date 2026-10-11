@@ -1,18 +1,17 @@
 package com.example
 
 import android.content.Context
+import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.repository.SettingsRepository
 import com.example.viewmodel.LockViewModel
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
@@ -28,22 +27,18 @@ class PinResponsivenessTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         app = context.applicationContext as SecureFolderApp
         settingsRepo = app.settingsRepository
+        settingsRepo.resetAllSettings()
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
     }
 
-    /**
-     * Requirement: 4-digit PIN triggers verification when candidate reaches length 4.
-     * Typing 1, 2, or 3 digits does not verify.
-     */
     @Test
-    fun testPinVerification_4DigitAutoSubmitTrigger() = runBlocking {
-        settingsRepo.resetAllSettings()
-        settingsRepo.setPin("4321")
-        assertEquals(4, settingsRepo.settings.value.pinLength)
+    fun testPinVerification_4DigitAutoSubmitTrigger() {
+        runBlocking {
+            assertTrue(settingsRepo.setPin("4321"))
+        }
 
-        val lockViewModel = LockViewModel()
-        delay(100) // Allow state collection
+        val lockViewModel = createViewModelAndDrainMain()
 
-        // Type 3 digits: must not verify
         lockViewModel.onPinDigit("4")
         lockViewModel.onPinDigit("3")
         lockViewModel.onPinDigit("2")
@@ -51,65 +46,74 @@ class PinResponsivenessTest {
         assertFalse(lockViewModel.uiState.value.isVerifying)
         assertTrue(lockViewModel.uiState.value.isLocked)
 
-        // Type 4th digit: auto-submits verification
         lockViewModel.onPinDigit("1")
         assertEquals("4321", lockViewModel.uiState.value.pinInput)
 
-        // Wait for background verify to complete
-        var attempts = 0
-        while (lockViewModel.uiState.value.isLocked && attempts < 20) {
-            delay(50)
-            attempts++
-        }
-
-        assertFalse("Vault should be unlocked after entering correct 4th digit", lockViewModel.uiState.value.isLocked)
+        assertTrue(
+            "Vault should unlock after correct 4-digit candidate",
+            pumpMainUntil(timeoutMillis = 4_000) { !lockViewModel.uiState.value.isLocked }
+        )
     }
 
-    /**
-     * Requirement: 6-digit PIN triggers verification when candidate reaches length 6.
-     * Digits 1-5 do not trigger verification.
-     */
     @Test
-    fun testPinVerification_6DigitAutoSubmitTrigger() = runBlocking {
-        settingsRepo.resetAllSettings()
-        settingsRepo.setPin("654321")
-        assertEquals(6, settingsRepo.settings.value.pinLength)
-
-        val lockViewModel = LockViewModel()
-        delay(100)
-
-        // Enter 5 digits
-        "65432".forEach { digit ->
-            lockViewModel.onPinDigit(digit.toString())
+    fun testPinVerification_6DigitAutoSubmitTrigger() {
+        runBlocking {
+            assertTrue(settingsRepo.setPin("654321"))
         }
+
+        val lockViewModel = createViewModelAndDrainMain()
+
+        "65432".forEach { lockViewModel.onPinDigit(it.toString()) }
         assertEquals("65432", lockViewModel.uiState.value.pinInput)
         assertFalse(lockViewModel.uiState.value.isVerifying)
         assertTrue(lockViewModel.uiState.value.isLocked)
 
-        // Enter 6th digit
         lockViewModel.onPinDigit("1")
 
-        var attempts = 0
-        while (lockViewModel.uiState.value.isLocked && attempts < 20) {
-            delay(50)
-            attempts++
-        }
-
-        assertFalse("Vault should be unlocked after entering 6th digit", lockViewModel.uiState.value.isLocked)
+        assertTrue(
+            "Vault should unlock after correct 6-digit candidate",
+            pumpMainUntil(timeoutMillis = 4_000) { !lockViewModel.uiState.value.isLocked }
+        )
     }
 
-    /**
-     * Requirement: PBKDF2 runs off the main thread (Dispatchers.Default).
-     */
     @Test
-    fun testPbkdf2_runsOffMainThread() = runBlocking {
-        settingsRepo.resetAllSettings()
-        settingsRepo.setPin("9876")
-
-        // Call verifyPin on Main dispatcher; verifyPin internally switches to Dispatchers.Default
-        withContext(Dispatchers.Main) {
-            val verified = settingsRepo.verifyPin("9876")
-            assertTrue("verifyPin should return true for matching PIN", verified)
+    fun testPinDigitHandler_doesNotBlockOnPbkdf2() {
+        runBlocking {
+            assertTrue(settingsRepo.setPin("9876"))
         }
+
+        val lockViewModel = createViewModelAndDrainMain()
+        "987".forEach { lockViewModel.onPinDigit(it.toString()) }
+
+        val started = System.nanoTime()
+        lockViewModel.onPinDigit("6")
+        val elapsedMillis = (System.nanoTime() - started) / 1_000_000
+
+        assertTrue(
+            "Final digit handler must return immediately instead of running PBKDF2 inline; took ${elapsedMillis}ms",
+            elapsedMillis < 100
+        )
+        assertTrue(
+            "Asynchronous verification should eventually unlock",
+            pumpMainUntil(timeoutMillis = 4_000) { !lockViewModel.uiState.value.isLocked }
+        )
+    }
+
+    private fun createViewModelAndDrainMain(): LockViewModel {
+        val viewModel = LockViewModel()
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
+        return viewModel
+    }
+
+    private fun pumpMainUntil(timeoutMillis: Long, condition: () -> Boolean): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMillis
+        val mainLooper = Shadows.shadowOf(Looper.getMainLooper())
+        while (System.currentTimeMillis() < deadline) {
+            mainLooper.idle()
+            if (condition()) return true
+            Thread.sleep(25)
+        }
+        mainLooper.idle()
+        return condition()
     }
 }

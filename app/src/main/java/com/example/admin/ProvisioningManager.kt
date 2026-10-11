@@ -4,13 +4,16 @@ import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.CrossProfileApps
 import android.content.pm.LauncherApps
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.os.UserHandle
 import android.os.UserManager
 import android.util.Log
+import com.example.core.profile.ManagedExecutorActivity
 import com.example.core.profile.ProfileRole
 import com.example.core.profile.WorkspaceState
 
@@ -189,6 +192,58 @@ class ProvisioningManager(private val context: Context) {
             }
         } catch (e: Exception) {
             ProvisioningState.DEVICE_NOT_SUPPORTED
+        }
+    }
+
+    /**
+     * Idempotently configures policy owned by this DPC inside the managed profile.
+     * This is intentionally callable after app upgrades so existing profiles are migrated,
+     * not only on the one-shot provisioning-complete callback.
+     */
+    fun ensureManagedProfileConfiguration(): Boolean {
+        if (getRole() != ProfileRole.MANAGED_EXECUTOR || !isProfileOwner()) {
+            return false
+        }
+
+        return try {
+            dpm.setProfileName(adminComponent, SecureFolderAdminReceiver.WORKSPACE_PROFILE_NAME)
+            dpm.setProfileEnabled(adminComponent)
+
+            // Cloning is intentionally user-mediated through PackageInstaller. The managed profile
+            // must permit the system's per-source "Install unknown apps" consent UI; this does not
+            // grant any installer permission by itself.
+            dpm.clearUserRestriction(
+                adminComponent,
+                UserManager.DISALLOW_INSTALL_UNKNOWN_SOURCES
+            )
+
+            context.packageManager.setComponentEnabledSetting(
+                ComponentName(context, ManagedExecutorActivity::class.java),
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                PackageManager.DONT_KILL_APP
+            )
+
+            // Rebuild only this DPC's cross-profile filters so upgrades cannot retain stale routing.
+            dpm.clearCrossProfileIntentFilters(adminComponent)
+            val commandFilter = IntentFilter().apply {
+                addAction(com.example.core.profile.CrossProfileBridge.ACTION_EXECUTE_COMMAND)
+                addCategory(Intent.CATEGORY_DEFAULT)
+            }
+            dpm.addCrossProfileIntentFilter(
+                adminComponent,
+                commandFilter,
+                DevicePolicyManager.FLAG_MANAGED_CAN_ACCESS_PARENT
+            )
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                dpm.setCrossProfilePackages(adminComponent, setOf(context.packageName))
+            }
+
+            Log.i(TAG, "Managed profile policy configuration ensured")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to ensure managed profile configuration", e)
+            false
         }
     }
 

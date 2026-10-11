@@ -105,6 +105,24 @@ class ExampleRobolectricTest {
             assertTrue(e.message?.contains("tamper", ignoreCase = true) == true || e.message?.contains("failed", ignoreCase = true) == true)
         }
 
+        // SFV2 must reject truncation even at a frame boundary because its terminal frame is authenticated.
+        val truncated = ciphertext.copyOf(ciphertext.size - 28)
+        try {
+            cipher.decryptStream(ByteArrayInputStream(truncated), ByteArrayOutputStream())
+            fail("Truncated SFV2 ciphertext must fail closed")
+        } catch (e: SecurityException) {
+            assertTrue(e.message?.contains("terminal", ignoreCase = true) == true || e.message?.contains("truncated", ignoreCase = true) == true)
+        }
+
+        // SFV2 also rejects appended garbage after the authenticated terminal frame.
+        val withTrailingByte = ciphertext + byteArrayOf(0x42)
+        try {
+            cipher.decryptStream(ByteArrayInputStream(withTrailingByte), ByteArrayOutputStream())
+            fail("Trailing bytes after SFV2 terminal frame must fail closed")
+        } catch (e: SecurityException) {
+            assertTrue(e.message?.contains("trailing", ignoreCase = true) == true)
+        }
+
         // Lock session and verify immediate revocation
         sessionManager.invalidateSession()
         try {

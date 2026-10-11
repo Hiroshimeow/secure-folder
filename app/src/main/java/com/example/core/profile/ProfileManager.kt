@@ -81,40 +81,19 @@ class ProfileManager(
     }
 
     /**
-     * Executes installExistingPackage directly ONLY if the current process is the Profile Owner.
-     * If called in Personal Controller (User 0), it fails-closed immediately without calling DPM.
+     * Direct silent cloning is deliberately unsupported for this personally-owned Work Profile.
+     * DevicePolicyManager.installExistingPackage() requires an affiliated profile, which this
+     * product model does not have. Clone/remove must go through ManagedExecutorActivity so Android
+     * can mediate user consent and the result can be verified against package-manager truth.
      */
     fun cloneAppIntoSecureFolder(packageName: String): Boolean {
-        if (!provisioningManager.isProfileOwner()) {
-            Log.w(TAG, "Personal Controller cannot invoke installExistingPackage directly. Must use Managed Executor.")
-            return false
-        }
-
-        return try {
-            val success = dpm.installExistingPackage(adminComponent, packageName)
-            Log.i(TAG, "installExistingPackage for $packageName result: $success")
-            success
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to clone app $packageName", e)
-            false
-        }
+        Log.w(TAG, "Direct clone is unsupported for $packageName; use Managed Executor user-mediated flow")
+        return false
     }
 
-    /**
-     * Executes unclone directly ONLY if the current process is the Profile Owner.
-     */
     fun uncloneApp(packageName: String): Boolean {
-        if (!provisioningManager.isProfileOwner()) {
-            Log.w(TAG, "Personal Controller cannot invoke setApplicationHidden directly. Must use Managed Executor.")
-            return false
-        }
-        return try {
-            dpm.setApplicationHidden(adminComponent, packageName, true)
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to hide/uninstall app $packageName in managed profile", e)
-            false
-        }
+        Log.w(TAG, "Direct remove is unsupported for $packageName; use Managed Executor user-mediated flow")
+        return false
     }
 
     /**

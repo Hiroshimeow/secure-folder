@@ -12,26 +12,30 @@ import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 
 /**
- * Enterprise Chunked Streaming AEAD (AES-256-GCM) Cipher for Secure Folder.
- * 
- * Architectural Guarantees:
- * 1. Chunked Framed AEAD (64 KB chunks): Avoids memory exhaustion (OOM) on large files.
- * 2. Strict Tag Verification (Zero Plaintext Leakage): Every chunk validates its 128-bit GCM
- *    authentication tag via cipher.doFinal() BEFORE a single byte of plaintext is written to the output stream.
- * 3. Immediate Fail-Closed Tampering Detection: Any bit flip, truncation, or tag mismatch instantly
- *    aborts with SecurityException, preventing release of unverified plaintext.
- * 4. Streaming Verification: Allows verifying entire file integrity without buffering in RAM.
+ * Chunked streaming AEAD (AES-256-GCM) for the local vault.
+ *
+ * SFV2 properties:
+ * - Android Keystore generates a fresh IV for every encryption operation.
+ * - Each data frame authenticates stream id, sequence, plaintext length and total bytes before it.
+ * - A final authenticated frame commits the final sequence and total plaintext length.
+ * - Decryption is fail-closed on truncation, reordering, duplication, trailing bytes or tag failure.
+ *
+ * SFV1 and the original unframed format remain readable for migration compatibility.
  */
 class VaultCipher(private val keyStoreManager: KeyStoreManager) {
 
     companion object {
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
-        private const val GCM_IV_LENGTH = 12 // 96-bit standard IV
-        private const val GCM_TAG_LENGTH = 128 // 128-bit authentication tag
-        private const val CHUNK_SIZE = 64 * 1024 // 64 KB chunks
+        private const val GCM_IV_LENGTH = 12
+        private const val GCM_TAG_LENGTH = 128
+        private const val GCM_TAG_BYTES = GCM_TAG_LENGTH / 8
+        private const val CHUNK_SIZE = 64 * 1024
+        private const val STREAM_ID_LENGTH = 16
+        private const val FRAME_DATA: Byte = 1
+        private const val FRAME_FINAL: Byte = 2
 
-        // Magic header: "SFV1" (Secure Folder Vault v1)
-        private val MAGIC_HEADER = byteArrayOf(0x53, 0x46, 0x56, 0x31)
+        private val MAGIC_V1 = byteArrayOf(0x53, 0x46, 0x56, 0x31)
+        private val MAGIC_V2 = byteArrayOf(0x53, 0x46, 0x56, 0x32)
     }
 
     private val secureRandom = SecureRandom()
@@ -43,9 +47,6 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
         }
     }
 
-    /**
-     * Encrypts small byte array (e.g. metadata, small notes) using framed single-chunk AEAD.
-     */
     fun encrypt(plainBytes: ByteArray): ByteArray {
         assertAuthorized()
         val out = ByteArrayOutputStream()
@@ -53,9 +54,6 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
         return out.toByteArray()
     }
 
-    /**
-     * Decrypts byte array verifying integrity tags before returning plaintext.
-     */
     fun decrypt(encryptedBytes: ByteArray): ByteArray {
         assertAuthorized()
         val out = ByteArrayOutputStream()
@@ -63,120 +61,232 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
         return out.toByteArray()
     }
 
-    /**
-     * Encrypts an input stream into framed chunked AEAD ciphertext.
-     * Frame format per chunk:
-     * [Magic 4B] (only at start of stream)
-     * For each chunk:
-     *   [Chunk Plaintext Length: 4B]
-     *   [IV: 12B]
-     *   [Ciphertext + 16B GCM Tag]
-     * [End-of-Stream Marker: 4B with value 0x00000000]
-     */
     fun encryptStream(input: InputStream, output: OutputStream) {
         assertAuthorized()
         val secretKey = keyStoreManager.getOrCreateMasterKey()
+        val streamId = ByteArray(STREAM_ID_LENGTH).also(secureRandom::nextBytes)
 
-        // 1. Write Stream Magic Header
-        output.write(MAGIC_HEADER)
+        output.write(MAGIC_V2)
+        output.write(streamId)
 
         val buffer = ByteArray(CHUNK_SIZE)
-        var bytesRead: Int
+        var sequence = 0L
+        var totalPlainBytes = 0L
 
-        while (input.read(buffer).also { bytesRead = it } != -1) {
+        while (true) {
+            val bytesRead = input.read(buffer)
+            if (bytesRead == -1) break
             if (bytesRead == 0) continue
 
-            // Generate fresh random 96-bit IV per chunk
-            val iv = ByteArray(GCM_IV_LENGTH)
-            secureRandom.nextBytes(iv)
-
             val cipher = Cipher.getInstance(TRANSFORMATION)
-            val spec = GCMParameterSpec(GCM_TAG_LENGTH, iv)
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey, spec)
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            val iv = cipher.iv ?: throw SecurityException("Encryption provider did not generate an IV")
+            if (iv.size != GCM_IV_LENGTH) {
+                throw SecurityException("Unexpected GCM IV length: ${iv.size}")
+            }
 
+            cipher.updateAAD(buildFrameAad(
+                magic = MAGIC_V2,
+                streamId = streamId,
+                frameType = FRAME_DATA,
+                sequence = sequence,
+                plainLength = bytesRead,
+                totalPlainBytes = totalPlainBytes
+            ))
             val cipherBytes = cipher.doFinal(buffer, 0, bytesRead)
 
-            // Write: [Plaintext Length: 4B][IV: 12B][Ciphertext + Tag]
-            val lenBuffer = ByteBuffer.allocate(4).putInt(bytesRead).array()
-            output.write(lenBuffer)
+            output.write(ByteBuffer.allocate(4).putInt(bytesRead).array())
+            output.write(ByteBuffer.allocate(8).putLong(sequence).array())
             output.write(iv)
             output.write(cipherBytes)
+
+            totalPlainBytes += bytesRead
+            sequence++
         }
 
-        // Write End-of-Stream terminal marker (length = 0)
+        val finalCipher = Cipher.getInstance(TRANSFORMATION)
+        finalCipher.init(Cipher.ENCRYPT_MODE, secretKey)
+        val finalIv = finalCipher.iv ?: throw SecurityException("Encryption provider did not generate a final-frame IV")
+        if (finalIv.size != GCM_IV_LENGTH) {
+            throw SecurityException("Unexpected final GCM IV length: ${finalIv.size}")
+        }
+        finalCipher.updateAAD(buildFrameAad(
+            magic = MAGIC_V2,
+            streamId = streamId,
+            frameType = FRAME_FINAL,
+            sequence = sequence,
+            plainLength = 0,
+            totalPlainBytes = totalPlainBytes
+        ))
+        val finalTag = finalCipher.doFinal()
+
         output.write(ByteBuffer.allocate(4).putInt(0).array())
+        output.write(ByteBuffer.allocate(8).putLong(sequence).array())
+        output.write(finalIv)
+        output.write(finalTag)
         output.flush()
     }
 
-    /**
-     * Decrypts framed chunked AEAD ciphertext stream.
-     * Strictly verifies each chunk's tag before writing plaintext to output.
-     * Throws SecurityException immediately if tag verification fails or stream is corrupted.
-     */
     @Throws(SecurityException::class)
     fun decryptStream(input: InputStream, output: OutputStream) {
         assertAuthorized()
-        val secretKey = keyStoreManager.getOrCreateMasterKey()
 
-        // 1. Verify Magic Header
-        val header = ByteArray(MAGIC_HEADER.size)
-        if (readFully(input, header) != MAGIC_HEADER.size || !header.contentEquals(MAGIC_HEADER)) {
-            // Check legacy fallback for unchunked data (backwards compatibility)
-            decryptLegacyStream(header, input, output)
-            return
+        val header = ByteArray(MAGIC_V2.size)
+        if (readFully(input, header) != header.size) {
+            throw SecurityException("Corrupted vault stream: truncated header")
+        }
+
+        when {
+            header.contentEquals(MAGIC_V2) -> decryptV2Stream(input, output)
+            header.contentEquals(MAGIC_V1) -> decryptV1Stream(input, output)
+            else -> decryptLegacyStream(header, input, output)
+        }
+    }
+
+    private fun decryptV2Stream(input: InputStream, output: OutputStream) {
+        val secretKey = keyStoreManager.getOrCreateMasterKey()
+        val streamId = ByteArray(STREAM_ID_LENGTH)
+        if (readFully(input, streamId) != streamId.size) {
+            throw SecurityException("Corrupted SFV2 stream: truncated stream id")
         }
 
         val lenBytes = ByteArray(4)
+        val seqBytes = ByteArray(8)
+        var expectedSequence = 0L
+        var totalPlainBytes = 0L
 
         while (true) {
-            if (readFully(input, lenBytes) != 4) {
-                throw SecurityException("Corrupted AEAD stream: truncated chunk length header")
+            if (readFully(input, lenBytes) != lenBytes.size) {
+                throw SecurityException("Corrupted SFV2 stream: missing authenticated terminal frame")
             }
+            if (readFully(input, seqBytes) != seqBytes.size) {
+                throw SecurityException("Corrupted SFV2 stream: truncated sequence")
+            }
+
             val plainLength = ByteBuffer.wrap(lenBytes).int
-            if (plainLength == 0) {
-                // End of Stream gracefully reached and authenticated
-                break
+            val sequence = ByteBuffer.wrap(seqBytes).long
+            if (sequence != expectedSequence) {
+                throw SecurityException("Corrupted SFV2 stream: unexpected sequence $sequence, expected $expectedSequence")
             }
             if (plainLength < 0 || plainLength > CHUNK_SIZE) {
-                throw SecurityException("Corrupted AEAD stream: invalid chunk length $plainLength")
+                throw SecurityException("Corrupted SFV2 stream: invalid chunk length $plainLength")
             }
 
-            // Read 12-byte IV
             val iv = ByteArray(GCM_IV_LENGTH)
-            if (readFully(input, iv) != GCM_IV_LENGTH) {
-                throw SecurityException("Corrupted AEAD stream: truncated IV")
+            if (readFully(input, iv) != iv.size) {
+                throw SecurityException("Corrupted SFV2 stream: truncated IV")
             }
 
-            // Ciphertext size = plainLength + 16 bytes tag
-            val cipherSize = plainLength + (GCM_TAG_LENGTH / 8)
-            val cipherBuffer = ByteArray(cipherSize)
-            if (readFully(input, cipherBuffer) != cipherSize) {
-                throw SecurityException("Corrupted AEAD stream: truncated ciphertext or authentication tag")
+            if (plainLength == 0) {
+                val finalTag = ByteArray(GCM_TAG_BYTES)
+                if (readFully(input, finalTag) != finalTag.size) {
+                    throw SecurityException("Corrupted SFV2 stream: truncated terminal authentication tag")
+                }
+
+                try {
+                    val cipher = Cipher.getInstance(TRANSFORMATION)
+                    cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_LENGTH, iv))
+                    cipher.updateAAD(buildFrameAad(
+                        magic = MAGIC_V2,
+                        streamId = streamId,
+                        frameType = FRAME_FINAL,
+                        sequence = sequence,
+                        plainLength = 0,
+                        totalPlainBytes = totalPlainBytes
+                    ))
+                    val terminalPlaintext = cipher.doFinal(finalTag)
+                    if (terminalPlaintext.isNotEmpty()) {
+                        throw SecurityException("Corrupted SFV2 stream: terminal frame produced plaintext")
+                    }
+                } catch (e: AEADBadTagException) {
+                    throw SecurityException("SFV2 terminal authentication failed", e)
+                } catch (e: SecurityException) {
+                    throw e
+                } catch (e: Exception) {
+                    throw SecurityException("SFV2 terminal verification failed", e)
+                }
+
+                if (input.read() != -1) {
+                    throw SecurityException("Corrupted SFV2 stream: trailing bytes after terminal frame")
+                }
+                output.flush()
+                return
+            }
+
+            val cipherBuffer = ByteArray(plainLength + GCM_TAG_BYTES)
+            if (readFully(input, cipherBuffer) != cipherBuffer.size) {
+                throw SecurityException("Corrupted SFV2 stream: truncated ciphertext or authentication tag")
             }
 
             try {
                 val cipher = Cipher.getInstance(TRANSFORMATION)
-                val spec = GCMParameterSpec(GCM_TAG_LENGTH, iv)
-                cipher.init(Cipher.DECRYPT_MODE, secretKey, spec)
-
-                // Atomic decryption + tag validation
+                cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_LENGTH, iv))
+                cipher.updateAAD(buildFrameAad(
+                    magic = MAGIC_V2,
+                    streamId = streamId,
+                    frameType = FRAME_DATA,
+                    sequence = sequence,
+                    plainLength = plainLength,
+                    totalPlainBytes = totalPlainBytes
+                ))
                 val plainChunk = cipher.doFinal(cipherBuffer)
-
-                // ONLY write to output AFTER tag is verified
+                if (plainChunk.size != plainLength) {
+                    throw SecurityException("Corrupted SFV2 stream: plaintext length mismatch")
+                }
                 output.write(plainChunk)
             } catch (e: AEADBadTagException) {
-                throw SecurityException("AEAD Authentication Tag Verification FAILED: File has been tampered or corrupted", e)
+                throw SecurityException("SFV2 authentication failed: file has been tampered or corrupted", e)
+            } catch (e: SecurityException) {
+                throw e
             } catch (e: Exception) {
-                throw SecurityException("Cryptographic verification failure during chunk decryption", e)
+                throw SecurityException("SFV2 cryptographic verification failure", e)
             }
+
+            totalPlainBytes += plainLength
+            expectedSequence++
         }
-        output.flush()
     }
 
-    /**
-     * Verifies stream integrity of large files without allocating memory for plaintext.
-     * Throws SecurityException if any chunk fails authentication.
-     */
+    private fun decryptV1Stream(input: InputStream, output: OutputStream) {
+        val secretKey = keyStoreManager.getOrCreateMasterKey()
+        val lenBytes = ByteArray(4)
+
+        while (true) {
+            if (readFully(input, lenBytes) != lenBytes.size) {
+                throw SecurityException("Corrupted SFV1 stream: truncated chunk length header")
+            }
+            val plainLength = ByteBuffer.wrap(lenBytes).int
+            if (plainLength == 0) {
+                output.flush()
+                return
+            }
+            if (plainLength < 0 || plainLength > CHUNK_SIZE) {
+                throw SecurityException("Corrupted SFV1 stream: invalid chunk length $plainLength")
+            }
+
+            val iv = ByteArray(GCM_IV_LENGTH)
+            if (readFully(input, iv) != iv.size) {
+                throw SecurityException("Corrupted SFV1 stream: truncated IV")
+            }
+
+            val cipherBuffer = ByteArray(plainLength + GCM_TAG_BYTES)
+            if (readFully(input, cipherBuffer) != cipherBuffer.size) {
+                throw SecurityException("Corrupted SFV1 stream: truncated ciphertext or authentication tag")
+            }
+
+            try {
+                val cipher = Cipher.getInstance(TRANSFORMATION)
+                cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_LENGTH, iv))
+                val plainChunk = cipher.doFinal(cipherBuffer)
+                output.write(plainChunk)
+            } catch (e: AEADBadTagException) {
+                throw SecurityException("SFV1 authentication failed: file has been tampered or corrupted", e)
+            } catch (e: Exception) {
+                throw SecurityException("SFV1 cryptographic verification failure", e)
+            }
+        }
+    }
+
     @Throws(SecurityException::class)
     fun verifyStreamIntegrity(input: InputStream) {
         assertAuthorized()
@@ -187,35 +297,55 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
         decryptStream(input, nullOutput)
     }
 
-    /**
-     * Convenience method for small in-memory payloads.
-     */
     fun decryptToByteArray(input: InputStream): ByteArray {
         val out = ByteArrayOutputStream()
         decryptStream(input, out)
         return out.toByteArray()
     }
 
+    private fun buildFrameAad(
+        magic: ByteArray,
+        streamId: ByteArray,
+        frameType: Byte,
+        sequence: Long,
+        plainLength: Int,
+        totalPlainBytes: Long
+    ): ByteArray {
+        return ByteBuffer.allocate(
+            magic.size + streamId.size + 1 + java.lang.Long.BYTES + Integer.BYTES + java.lang.Long.BYTES
+        )
+            .put(magic)
+            .put(streamId)
+            .put(frameType)
+            .putLong(sequence)
+            .putInt(plainLength)
+            .putLong(totalPlainBytes)
+            .array()
+    }
+
     private fun decryptLegacyStream(header: ByteArray, input: InputStream, output: OutputStream) {
         val secretKey = keyStoreManager.getOrCreateMasterKey()
-        // If file was encrypted with legacy unchunked format [12B IV + Ciphertext]
         val iv = ByteArray(GCM_IV_LENGTH)
         System.arraycopy(header, 0, iv, 0, minOf(header.size, GCM_IV_LENGTH))
         val remainingIv = GCM_IV_LENGTH - header.size
-        if (remainingIv > 0) {
-            readFully(input, iv, header.size, remainingIv)
+        if (remainingIv > 0 && readFully(input, iv, header.size, remainingIv) != remainingIv) {
+            throw SecurityException("Corrupted legacy vault stream: truncated IV")
         }
 
         val allRemaining = input.readBytes()
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        val spec = GCMParameterSpec(GCM_TAG_LENGTH, iv)
-        cipher.init(Cipher.DECRYPT_MODE, secretKey, spec)
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_LENGTH, iv))
         val decrypted = cipher.doFinal(allRemaining)
         output.write(decrypted)
         output.flush()
     }
 
-    private fun readFully(input: InputStream, buffer: ByteArray, offset: Int = 0, length: Int = buffer.size - offset): Int {
+    private fun readFully(
+        input: InputStream,
+        buffer: ByteArray,
+        offset: Int = 0,
+        length: Int = buffer.size - offset
+    ): Int {
         var total = 0
         while (total < length) {
             val count = input.read(buffer, offset + total, length - total)
@@ -225,4 +355,3 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
         return total
     }
 }
-

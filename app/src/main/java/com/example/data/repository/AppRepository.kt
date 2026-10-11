@@ -5,8 +5,10 @@ import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Rect
+import android.net.Uri
 import android.util.Log
 import com.example.admin.ProvisioningManager
+import com.example.core.profile.ClonePackageStager
 import com.example.core.profile.ProfileManager
 import com.example.data.model.ClonedApp
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +36,7 @@ class AppRepository(
 
     private val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val packageManager: PackageManager = context.packageManager
+    private val clonePackageStager = ClonePackageStager(context)
 
     private val _clonedApps = MutableStateFlow<List<ClonedApp>>(emptyList())
     val clonedApps: StateFlow<List<ClonedApp>> = _clonedApps.asStateFlow()
@@ -131,6 +134,14 @@ class AppRepository(
         }
 
         _availableHostApps.value = result.sortedBy { it.appLabel }
+    }
+
+    suspend fun stageClonePackage(packageName: String): ArrayList<Uri> {
+        return clonePackageStager.stage(packageName)
+    }
+
+    fun cleanupStagedClone(packageName: String) {
+        clonePackageStager.cleanup(packageName)
     }
 
     /**

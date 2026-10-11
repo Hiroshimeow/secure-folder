@@ -130,7 +130,12 @@ class SettingsRepository(context: Context) {
             val hash = factory.generateSecret(spec).encoded
             Base64.encodeToString(hash, Base64.NO_WRAP)
         } catch (e: Exception) {
-            // Fallback for testing environments lacking PBKDF2 provider
+            // Production must never silently downgrade PIN KDF strength.
+            if (System.getProperty("is.testing") != "true") {
+                throw IllegalStateException("PBKDF2WithHmacSHA256 unavailable on production device", e)
+            }
+
+            // Deterministic test-only fallback for JVM/Robolectric providers that lack PBKDF2.
             val md = MessageDigest.getInstance("SHA-256")
             var current = pin.toByteArray(Charsets.UTF_8) + salt
             for (i in 0 until 10000) {

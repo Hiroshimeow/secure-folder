@@ -1,18 +1,24 @@
 package com.example.viewmodel
 
+import android.app.Activity
 import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.SecureFolderApp
+import com.example.core.profile.CrossProfileDispatchResult
+import com.example.core.profile.CrossProfileDispatchState
 import com.example.core.profile.PackageOpState
 import com.example.core.profile.PackageStatusInfo
 import com.example.core.profile.ProfileRole
 import com.example.core.profile.WorkspaceState
 import com.example.data.model.ClonedApp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class HomeUiState(
     val clonedApps: List<ClonedApp> = emptyList(),
@@ -29,7 +35,6 @@ class FolderHomeViewModel : ViewModel() {
 
     private val appRepository = SecureFolderApp.instance.appRepository
     private val provisioningManager = SecureFolderApp.instance.provisioningManager
-    private val profileManager = SecureFolderApp.instance.profileManager
     private val crossProfileBridge = SecureFolderApp.instance.crossProfileBridge
 
     private val _uiState = MutableStateFlow(HomeUiState())
@@ -117,23 +122,29 @@ class FolderHomeViewModel : ViewModel() {
             }
         }
 
-        setPackageStatus(app.packageName, PackageOpState.CLONING, "Đang thêm vào Private Workspace…")
+        setPackageStatus(app.packageName, PackageOpState.CLONING, "Đang chuẩn bị APK an toàn…")
 
-        // If running in managed profile with Profile Owner directly (e.g. testing)
-        if (provisioningManager.isProfileOwner()) {
-            viewModelScope.launch {
-                val directSuccess = profileManager.cloneAppIntoSecureFolder(app.packageName)
-                onCloneCommandResult(app.packageName, directSuccess, if (directSuccess) null else "Cài đặt thất bại")
+        viewModelScope.launch {
+            try {
+                val apkUris = appRepository.stageClonePackage(app.packageName)
+                check(apkUris.isNotEmpty()) { "Không tìm thấy APK của ứng dụng" }
+
+                setPackageStatus(
+                    app.packageName,
+                    PackageOpState.CLONING,
+                    "Đang thêm vào Private Workspace…"
+                )
+                onDispatchCommand(
+                    crossProfileBridge.createCloneIntent(app.packageName, apkUris)
+                )
+            } catch (e: Exception) {
+                appRepository.cleanupStagedClone(app.packageName)
+                setPackageStatus(
+                    app.packageName,
+                    PackageOpState.FAILED,
+                    "Không thể chuẩn bị/cài ứng dụng: ${e.message}"
+                )
             }
-            return
-        }
-
-        // Cross-profile command dispatch to Managed Executor
-        val intent = crossProfileBridge.createCloneIntent(app.packageName)
-        try {
-            onDispatchCommand(intent)
-        } catch (e: Exception) {
-            setPackageStatus(app.packageName, PackageOpState.FAILED, "Không thể chuyển lệnh: ${e.message}")
         }
     }
 
@@ -142,22 +153,30 @@ class FolderHomeViewModel : ViewModel() {
      */
     fun onCloneCommandResult(packageName: String, isSuccess: Boolean, errorMessage: String?) {
         viewModelScope.launch {
-            if (isSuccess) {
-                val verified = appRepository.verifyAndApplyClone(packageName)
-                if (verified) {
-                    setPackageStatus(packageName, PackageOpState.CLONED, "Đã thêm")
-                    _uiState.value = _uiState.value.copy(
-                        statusMessage = "Đã nhân bản ứng dụng thành công"
-                    )
+            try {
+                if (isSuccess) {
+                    val verified = appRepository.verifyAndApplyClone(packageName)
+                    if (verified) {
+                        setPackageStatus(packageName, PackageOpState.CLONED, "Đã thêm")
+                        _uiState.value = _uiState.value.copy(
+                            statusMessage = "Đã nhân bản ứng dụng thành công"
+                        )
+                    } else {
+                        setPackageStatus(
+                            packageName,
+                            PackageOpState.FAILED,
+                            "Cài đặt thành công nhưng chưa xác thực được"
+                        )
+                    }
                 } else {
-                    setPackageStatus(packageName, PackageOpState.FAILED, "Cài đặt thành công nhưng chưa xác thực được")
+                    setPackageStatus(
+                        packageName,
+                        PackageOpState.FAILED,
+                        errorMessage ?: "Không thể nhân bản vào Private Workspace"
+                    )
                 }
-            } else {
-                setPackageStatus(
-                    packageName,
-                    PackageOpState.FAILED,
-                    errorMessage ?: "Không thể nhân bản vào Private Workspace"
-                )
+            } finally {
+                appRepository.cleanupStagedClone(packageName)
             }
         }
     }
@@ -172,14 +191,6 @@ class FolderHomeViewModel : ViewModel() {
         }
 
         setPackageStatus(app.packageName, PackageOpState.REMOVING, "Đang gỡ bỏ…")
-
-        if (provisioningManager.isProfileOwner()) {
-            viewModelScope.launch {
-                val directSuccess = profileManager.uncloneApp(app.packageName)
-                onRemoveCommandResult(app.packageName, directSuccess, if (directSuccess) null else "Gỡ ứng dụng thất bại")
-            }
-            return
-        }
 
         val intent = crossProfileBridge.createRemoveIntent(app.packageName)
         try {
@@ -203,6 +214,80 @@ class FolderHomeViewModel : ViewModel() {
                 }
             } else {
                 setPackageStatus(packageName, PackageOpState.FAILED, errorMessage ?: "Gỡ ứng dụng thất bại")
+            }
+        }
+    }
+
+    fun dispatchCrossProfileCommand(
+        activity: Activity,
+        intent: Intent
+    ): CrossProfileDispatchResult {
+        val result = crossProfileBridge.dispatchToManagedProfile(activity, intent)
+        if (result.state == CrossProfileDispatchState.DISPATCHED) {
+            monitorDispatchedCommand(intent)
+        }
+        return result
+    }
+
+    fun onCrossProfileDispatchFailure(intent: Intent, errorMessage: String?) {
+        val packageName = intent.getStringExtra(
+            com.example.core.profile.CrossProfileBridge.EXTRA_TARGET_PACKAGE
+        ) ?: return
+
+        when (intent.getStringExtra(com.example.core.profile.CrossProfileBridge.EXTRA_COMMAND)) {
+            com.example.core.profile.CrossProfileBridge.COMMAND_CLONE ->
+                onCloneCommandResult(packageName, false, errorMessage)
+            com.example.core.profile.CrossProfileBridge.COMMAND_REMOVE ->
+                onRemoveCommandResult(packageName, false, errorMessage)
+        }
+    }
+
+    private fun monitorDispatchedCommand(intent: Intent) {
+        val packageName = intent.getStringExtra(
+            com.example.core.profile.CrossProfileBridge.EXTRA_TARGET_PACKAGE
+        ) ?: return
+        val command = intent.getStringExtra(
+            com.example.core.profile.CrossProfileBridge.EXTRA_COMMAND
+        ) ?: return
+
+        viewModelScope.launch {
+            // System installer/uninstaller UI can outlive the executor Activity. Only OS package
+            // state is authoritative, so monitor that state instead of trusting local callbacks.
+            repeat(90) {
+                delay(1_000)
+                val exists = withContext(Dispatchers.IO) {
+                    appRepository.isPackageInWorkProfile(packageName)
+                }
+
+                when (command) {
+                    com.example.core.profile.CrossProfileBridge.COMMAND_CLONE -> {
+                        if (exists) {
+                            onCloneCommandResult(packageName, true, null)
+                            return@launch
+                        }
+                    }
+                    com.example.core.profile.CrossProfileBridge.COMMAND_REMOVE -> {
+                        if (!exists) {
+                            onRemoveCommandResult(packageName, true, null)
+                            return@launch
+                        }
+                    }
+                }
+            }
+
+            when (command) {
+                com.example.core.profile.CrossProfileBridge.COMMAND_CLONE ->
+                    onCloneCommandResult(
+                        packageName,
+                        false,
+                        "Cài đặt đã bị hủy, thất bại hoặc hết thời gian chờ"
+                    )
+                com.example.core.profile.CrossProfileBridge.COMMAND_REMOVE ->
+                    onRemoveCommandResult(
+                        packageName,
+                        false,
+                        "Gỡ cài đặt đã bị hủy, thất bại hoặc hết thời gian chờ"
+                    )
             }
         }
     }
