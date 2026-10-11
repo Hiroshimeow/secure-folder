@@ -67,6 +67,10 @@ class ManagedExecutorActivity : Activity() {
             return
         }
 
+        dispatchPendingCommand()
+    }
+
+    private fun dispatchPendingCommand() {
         when (pendingCommand) {
             CrossProfileBridge.COMMAND_CLONE -> startCloneFlow()
             CrossProfileBridge.COMMAND_REMOVE -> startRemoveFlow()
@@ -89,7 +93,12 @@ class ManagedExecutorActivity : Activity() {
 
         if (intent.action == ACTION_INSTALL_SESSION_STATUS) {
             handleInstallSessionStatus(intent)
+            return
         }
+
+        // singleTop reuses this activity for later workspace commands. Process the new command
+        // instead of silently dropping it after a prior installer/uninstaller round-trip.
+        dispatchPendingCommand()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
