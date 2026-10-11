@@ -92,6 +92,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.ExternalSystemFlowLease
 import com.example.core.profile.CrossProfileDispatchState
 import com.example.core.profile.PackageOpState
 import com.example.core.profile.WorkspaceState
@@ -141,12 +142,14 @@ fun FolderHomeScreen(
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
         val pending = pendingCrossProfileIntent ?: return@rememberLauncherForActivityResult
+        ExternalSystemFlowLease.acquireLease(120_000L)
         val result = viewModel.dispatchCrossProfileCommand(context as Activity, pending)
         when (result.state) {
             CrossProfileDispatchState.DISPATCHED -> {
                 pendingCrossProfileIntent = null
             }
             CrossProfileDispatchState.CONSENT_REQUIRED -> {
+                ExternalSystemFlowLease.releaseLease()
                 pendingCrossProfileIntent = null
                 viewModel.onCrossProfileDispatchFailure(
                     pending,
@@ -154,6 +157,7 @@ fun FolderHomeScreen(
                 )
             }
             CrossProfileDispatchState.UNAVAILABLE -> {
+                ExternalSystemFlowLease.releaseLease()
                 pendingCrossProfileIntent = null
                 viewModel.onCrossProfileDispatchFailure(pending, result.errorMessage)
             }
@@ -161,6 +165,9 @@ fun FolderHomeScreen(
     }
 
     val dispatchCrossProfileCommand: (Intent) -> Unit = { commandIntent ->
+        // Clone/remove opens trusted Android system UI in the managed profile. Keep the personal
+        // vault session alive only for this bounded round-trip, matching document-picker behavior.
+        ExternalSystemFlowLease.acquireLease(120_000L)
         val result = viewModel.dispatchCrossProfileCommand(context as Activity, commandIntent)
         when (result.state) {
             CrossProfileDispatchState.DISPATCHED -> Unit
@@ -170,6 +177,7 @@ fun FolderHomeScreen(
                     pendingCrossProfileIntent = commandIntent
                     crossProfileConsentLauncher.launch(consentIntent)
                 } else {
+                    ExternalSystemFlowLease.releaseLease()
                     viewModel.onCrossProfileDispatchFailure(
                         commandIntent,
                         "Không thể mở cài đặt quyền cross-profile"
@@ -177,6 +185,7 @@ fun FolderHomeScreen(
                 }
             }
             CrossProfileDispatchState.UNAVAILABLE -> {
+                ExternalSystemFlowLease.releaseLease()
                 viewModel.onCrossProfileDispatchFailure(commandIntent, result.errorMessage)
             }
         }
