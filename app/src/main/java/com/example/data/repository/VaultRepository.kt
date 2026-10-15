@@ -1,4 +1,4 @@
-package com.example.data.repository
+﻿package com.example.data.repository
 
 import android.content.Context
 import android.content.IntentSender
@@ -8,7 +8,9 @@ import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.AtomicFile
 import android.util.Log
+import com.example.SecureFolderApp
 import com.example.core.crypto.VaultCipher
+import com.example.core.session.VaultSessionMode
 import com.example.data.model.VaultItemType
 import com.example.data.model.VaultMediaItem
 import kotlinx.coroutines.Dispatchers
@@ -58,16 +60,21 @@ class VaultRepository(
 
     companion object {
         private const val TAG = "VaultRepository"
-        private const val VAULT_DIR = "secure_vault"
+        private const val PRIMARY_VAULT_DIR = "secure_vault"
+        private const val DECOY_VAULT_DIR = "secure_vault_decoy"
         private const val INDEX_FILE = "vault_index.enc"
     }
 
-    private val vaultDir: File = File(context.filesDir, VAULT_DIR).apply {
-        if (!exists()) mkdirs()
+    private val vaultMutex = Mutex()
+
+    private fun currentVaultDir(): File {
+        val mode = SecureFolderApp.instance.sessionManager.sessionMode.value
+            ?: throw SecurityException("Vault storage access denied without an authenticated identity")
+        val name = if (mode == VaultSessionMode.DECOY) DECOY_VAULT_DIR else PRIMARY_VAULT_DIR
+        return File(context.filesDir, name).apply { if (!exists()) mkdirs() }
     }
 
-    private val atomicIndexFile = AtomicFile(File(vaultDir, INDEX_FILE))
-    private val vaultMutex = Mutex()
+    private fun currentAtomicIndexFile(): AtomicFile = AtomicFile(File(currentVaultDir(), INDEX_FILE))
 
     private val _vaultItems = MutableStateFlow<List<VaultMediaItem>>(emptyList())
     val vaultItems: StateFlow<List<VaultMediaItem>> = _vaultItems.asStateFlow()
@@ -79,11 +86,11 @@ class VaultRepository(
     @Synchronized
     fun loadVaultIndex() {
         try {
-            if (!atomicIndexFile.baseFile.exists()) {
+            if (!currentAtomicIndexFile().baseFile.exists()) {
                 _vaultItems.value = emptyList()
                 return
             }
-            val encryptedBytes = atomicIndexFile.readFully()
+            val encryptedBytes = currentAtomicIndexFile().readFully()
             if (encryptedBytes.isEmpty()) {
                 _vaultItems.value = emptyList()
                 return
@@ -140,14 +147,15 @@ class VaultRepository(
         val plainBytes = jsonArray.toString().toByteArray(Charsets.UTF_8)
         val encryptedBytes = vaultCipher.encrypt(plainBytes)
 
+        val atomicFile = currentAtomicIndexFile()
         var fos: FileOutputStream? = null
         try {
-            fos = atomicIndexFile.startWrite()
+            fos = atomicFile.startWrite()
             fos.write(encryptedBytes)
-            atomicIndexFile.finishWrite(fos)
+            atomicFile.finishWrite(fos)
         } catch (e: Exception) {
             if (fos != null) {
-                atomicIndexFile.failWrite(fos)
+                atomicFile.failWrite(fos)
             }
             throw IOException("Atomic index commit failed", e)
         }
@@ -174,7 +182,7 @@ class VaultRepository(
             try {
                 val id = UUID.randomUUID().toString()
                 val encFileName = "$id.enc"
-                val targetFile = File(vaultDir, encFileName)
+                val targetFile = File(currentVaultDir(), encFileName)
 
                 val openStream = context.contentResolver.openInputStream(uri)
                     ?: return@withContext Result.failure(Exception("Cannot open stream for URI $uri"))
@@ -286,7 +294,7 @@ class VaultRepository(
             try {
                 val id = UUID.randomUUID().toString()
                 val encFileName = "CAM_$id.enc"
-                val targetFile = File(vaultDir, encFileName)
+                val targetFile = File(currentVaultDir(), encFileName)
 
                 val encrypted = vaultCipher.encrypt(bytes)
                 targetFile.writeBytes(encrypted)
@@ -326,7 +334,7 @@ class VaultRepository(
             try {
                 val id = existingId ?: UUID.randomUUID().toString()
                 val encFileName = "NOTE_$id.enc"
-                val tempFile = File(vaultDir, "$encFileName.tmp")
+                val tempFile = File(currentVaultDir(), "$encFileName.tmp")
 
                 val encryptedBytes = vaultCipher.encrypt(content.toByteArray(Charsets.UTF_8))
                 tempFile.writeBytes(encryptedBytes)
@@ -337,7 +345,7 @@ class VaultRepository(
                     return@withContext Result.failure(IllegalStateException("Note verification mismatch"))
                 }
 
-                val targetFile = File(vaultDir, encFileName)
+                val targetFile = File(currentVaultDir(), encFileName)
                 val renamed = tempFile.renameTo(targetFile)
                 if (!renamed) {
                     tempFile.delete()
@@ -373,7 +381,7 @@ class VaultRepository(
      */
     suspend fun decryptItemBytes(item: VaultMediaItem): ByteArray? = withContext(Dispatchers.IO) {
         try {
-            val file = File(vaultDir, item.fileName)
+            val file = File(currentVaultDir(), item.fileName)
             if (!file.exists()) return@withContext null
             FileInputStream(file).use { input ->
                 vaultCipher.decryptToByteArray(input)
@@ -404,7 +412,7 @@ class VaultRepository(
     suspend fun securelyDeleteItem(item: VaultMediaItem): Boolean = withContext(Dispatchers.IO) {
         vaultMutex.withLock {
             try {
-                val file = File(vaultDir, item.fileName)
+                val file = File(currentVaultDir(), item.fileName)
                 if (file.exists()) {
                     val totalLength = file.length()
                     if (totalLength > 0) {
@@ -439,47 +447,73 @@ class VaultRepository(
     }
 
     /**
-     * Complete Vault Data Wipe:
-     * Overwrites 100% of all bytes of every file in the vault with random data, syncs, and deletes.
+     * Wipes the currently authenticated logical vault.
+     * Note: overwrite-before-delete is best-effort on flash storage; cryptographic key deletion is
+     * the primary confidentiality boundary during a full reset.
      */
     suspend fun wipeAllVaultData(): Boolean = withContext(Dispatchers.IO) {
         vaultMutex.withLock {
-            try {
-                val files = vaultDir.listFiles() ?: emptyArray()
-                val random = SecureRandom()
-                val buffer = ByteArray(64 * 1024)
+            val success = wipeVaultDirectory(currentVaultDir())
+            if (success) _vaultItems.value = emptyList()
+            success
+        }
+    }
 
-                for (file in files) {
-                    if (file.isFile) {
-                        try {
-                            val total = file.length()
-                            if (total > 0) {
-                                var remaining = total
-                                FileOutputStream(file).use { out ->
-                                    while (remaining > 0) {
-                                        val toWrite = minOf(remaining, buffer.size.toLong()).toInt()
-                                        random.nextBytes(buffer)
-                                        out.write(buffer, 0, toWrite)
-                                        remaining -= toWrite
-                                    }
-                                    out.flush()
-                                    out.fd.sync()
-                                }
-                            }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Error wiping content of ${file.name}: ${e.message}")
-                        }
-                        file.delete()
-                    }
+    /** Full product reset: wipe both PRIMARY and DECOY namespaces before deleting both keys. */
+    suspend fun wipeAllVaultNamespaces(): Boolean = withContext(Dispatchers.IO) {
+        vaultMutex.withLock {
+            val primary = File(context.filesDir, PRIMARY_VAULT_DIR)
+            val decoy = File(context.filesDir, DECOY_VAULT_DIR)
+            val primaryOk = wipeVaultDirectory(primary)
+            val decoyOk = wipeVaultDirectory(decoy)
+            _vaultItems.value = emptyList()
+            primaryOk && decoyOk
+        }
+    }
+
+    private fun wipeVaultDirectory(directory: File): Boolean {
+        return try {
+            if (!directory.exists()) return true
+            val files = directory.listFiles() ?: emptyArray()
+            val random = SecureRandom()
+            val buffer = ByteArray(64 * 1024)
+
+            for (file in files) {
+                if (file.isDirectory) {
+                    file.deleteRecursively()
+                    continue
                 }
-
-                atomicIndexFile.delete()
-                _vaultItems.value = emptyList()
-                true
-            } catch (e: Exception) {
-                Log.e(TAG, "Error during complete vault wipe", e)
-                false
+                try {
+                    val total = file.length()
+                    if (total > 0) {
+                        var remaining = total
+                        FileOutputStream(file).use { out ->
+                            while (remaining > 0) {
+                                val toWrite = minOf(remaining, buffer.size.toLong()).toInt()
+                                random.nextBytes(buffer)
+                                out.write(buffer, 0, toWrite)
+                                remaining -= toWrite
+                            }
+                            out.flush()
+                            out.fd.sync()
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Best-effort overwrite failed for ${file.name}: ${e.message}")
+                }
+                if (!file.delete() && file.exists()) {
+                    Log.w(TAG, "Unable to delete vault file: ${file.absolutePath}")
+                    return false
+                }
             }
+
+            if (!directory.delete() && directory.exists() && directory.listFiles()?.isNotEmpty() == true) {
+                return false
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error wiping vault namespace ${directory.name}", e)
+            false
         }
     }
 }

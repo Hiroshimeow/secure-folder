@@ -17,7 +17,8 @@ class KeyStoreManager {
 
     companion object {
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
-        private const val KEY_ALIAS = "SamsungSecureFolderMasterKey"
+        private const val PRIMARY_KEY_ALIAS = "SamsungSecureFolderMasterKey"
+        private const val DECOY_KEY_ALIAS = "SamsungSecureFolderDecoyKey"
         private const val KEY_SIZE = 256
     }
 
@@ -46,44 +47,47 @@ class KeyStoreManager {
         }
     }
 
-    // JVM/Robolectric test fallback in-memory key - strictly restricted to unit tests
-    private var jvmTestOnlyKey: SecretKey? = null
+    // JVM/Robolectric test fallback keys - strictly restricted to unit tests.
+    private var jvmTestOnlyPrimaryKey: SecretKey? = null
+    private var jvmTestOnlyDecoyKey: SecretKey? = null
 
-    /**
-     * Retrieves the master SecretKey, or generates a new one if not present.
-     * Enforces fail-closed semantics on production devices: Never uses in-memory keys on real devices!
-     */
     @Synchronized
-    fun getOrCreateMasterKey(): SecretKey {
+    fun getOrCreateMasterKey(): SecretKey = getOrCreateKey(PRIMARY_KEY_ALIAS, decoy = false)
+
+    @Synchronized
+    fun getOrCreateDecoyKey(): SecretKey = getOrCreateKey(DECOY_KEY_ALIAS, decoy = true)
+
+    private fun getOrCreateKey(alias: String, decoy: Boolean): SecretKey {
         val ks = keyStore
         if (ks == null) {
-            if (isRunningInTestEnvironment) {
-                if (jvmTestOnlyKey == null) {
-                    val kgen = KeyGenerator.getInstance("AES")
-                    kgen.init(KEY_SIZE)
-                    jvmTestOnlyKey = kgen.generateKey()
-                }
-                return jvmTestOnlyKey!!
-            } else {
+            if (!isRunningInTestEnvironment) {
                 throw KeyStoreException("AndroidKeyStore is unavailable. In-memory keys are strictly forbidden on production hardware.")
             }
+            val existing = if (decoy) jvmTestOnlyDecoyKey else jvmTestOnlyPrimaryKey
+            if (existing != null) return existing
+
+            val kgen = KeyGenerator.getInstance("AES")
+            kgen.init(KEY_SIZE)
+            val generated = kgen.generateKey()
+            if (decoy) jvmTestOnlyDecoyKey = generated else jvmTestOnlyPrimaryKey = generated
+            return generated
         }
 
-        if (!ks.containsAlias(KEY_ALIAS)) {
-            generateMasterKey(ks)
+        if (!ks.containsAlias(alias)) {
+            generateKey(alias)
         }
-        val entry = ks.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
-        return entry?.secretKey ?: generateMasterKey(ks)
+        val entry = ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry
+        return entry?.secretKey ?: generateKey(alias)
     }
 
-    private fun generateMasterKey(ks: KeyStore): SecretKey {
+    private fun generateKey(alias: String): SecretKey {
         val keyGenerator = KeyGenerator.getInstance(
             KeyProperties.KEY_ALGORITHM_AES,
             ANDROID_KEYSTORE
         )
 
         val keyGenParameterSpec = KeyGenParameterSpec.Builder(
-            KEY_ALIAS,
+            alias,
             KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
         )
             .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
@@ -96,15 +100,20 @@ class KeyStoreManager {
         return keyGenerator.generateKey()
     }
 
-    /**
-     * Deletes the key alias on vault reset.
-     */
+    /** Deletes both logical-vault keys on a full reset. */
     @Synchronized
     fun deleteKey() {
+        deleteAllKeys()
+    }
+
+    @Synchronized
+    fun deleteAllKeys() {
         val ks = keyStore
-        if (ks != null && ks.containsAlias(KEY_ALIAS)) {
-            ks.deleteEntry(KEY_ALIAS)
+        if (ks != null) {
+            if (ks.containsAlias(PRIMARY_KEY_ALIAS)) ks.deleteEntry(PRIMARY_KEY_ALIAS)
+            if (ks.containsAlias(DECOY_KEY_ALIAS)) ks.deleteEntry(DECOY_KEY_ALIAS)
         }
-        jvmTestOnlyKey = null
+        jvmTestOnlyPrimaryKey = null
+        jvmTestOnlyDecoyKey = null
     }
 }

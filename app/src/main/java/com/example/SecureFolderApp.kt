@@ -6,6 +6,7 @@ import com.example.core.crypto.KeyStoreManager
 import com.example.core.crypto.VaultCipher
 import com.example.core.profile.CrossProfileBridge
 import com.example.core.profile.ProfileManager
+import com.example.core.profile.WorkspaceAccessController
 import com.example.data.repository.AppRepository
 import com.example.data.repository.SettingsRepository
 import com.example.data.repository.VaultRepository
@@ -27,6 +28,8 @@ class SecureFolderApp : Application() {
         private set
     lateinit var crossProfileBridge: CrossProfileBridge
         private set
+    lateinit var workspaceAccessController: WorkspaceAccessController
+        private set
     lateinit var sessionManager: com.example.core.session.SessionManager
         private set
     lateinit var settingsRepository: SettingsRepository
@@ -45,7 +48,11 @@ class SecureFolderApp : Application() {
         provisioningManager = ProvisioningManager(this)
         profileManager = ProfileManager(this, provisioningManager)
         crossProfileBridge = CrossProfileBridge(this, provisioningManager)
+        workspaceAccessController = WorkspaceAccessController(this)
         sessionManager = com.example.core.session.SessionManager()
+
+        // Managed executor is fail-closed. A process restart never preserves an unlocked app gate.
+        workspaceAccessController.enforceFailClosedOnProcessStart()
 
         settingsRepository = SettingsRepository(this)
         vaultRepository = VaultRepository(this, vaultCipher)

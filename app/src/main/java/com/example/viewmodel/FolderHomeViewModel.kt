@@ -36,6 +36,7 @@ class FolderHomeViewModel : ViewModel() {
     private val appRepository = SecureFolderApp.instance.appRepository
     private val provisioningManager = SecureFolderApp.instance.provisioningManager
     private val crossProfileBridge = SecureFolderApp.instance.crossProfileBridge
+    private val profileManager = SecureFolderApp.instance.profileManager
 
     private val _uiState = MutableStateFlow(HomeUiState())
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
@@ -177,6 +178,7 @@ class FolderHomeViewModel : ViewModel() {
                 }
             } finally {
                 appRepository.cleanupStagedClone(packageName)
+                restoreWorkspaceGateForActiveSession()
             }
         }
     }
@@ -202,20 +204,33 @@ class FolderHomeViewModel : ViewModel() {
 
     fun onRemoveCommandResult(packageName: String, isSuccess: Boolean, errorMessage: String?) {
         viewModelScope.launch {
-            if (isSuccess) {
-                val verified = appRepository.verifyAndApplyRemoval(packageName)
-                if (verified) {
-                    setPackageStatus(packageName, PackageOpState.AVAILABLE, null)
-                    _uiState.value = _uiState.value.copy(
-                        statusMessage = "Đã gỡ ứng dụng khỏi Private Workspace"
-                    )
+            try {
+                if (isSuccess) {
+                    val verified = appRepository.verifyAndApplyRemoval(packageName)
+                    if (verified) {
+                        setPackageStatus(packageName, PackageOpState.AVAILABLE, null)
+                        _uiState.value = _uiState.value.copy(
+                            statusMessage = "Đã gỡ ứng dụng khỏi Private Workspace"
+                        )
+                    } else {
+                        setPackageStatus(packageName, PackageOpState.FAILED, "Ứng dụng vẫn còn tồn tại trong workspace")
+                    }
                 } else {
-                    setPackageStatus(packageName, PackageOpState.FAILED, "Ứng dụng vẫn còn tồn tại trong workspace")
+                    setPackageStatus(packageName, PackageOpState.FAILED, errorMessage ?: "Gỡ ứng dụng thất bại")
                 }
-            } else {
-                setPackageStatus(packageName, PackageOpState.FAILED, errorMessage ?: "Gỡ ứng dụng thất bại")
+            } finally {
+                restoreWorkspaceGateForActiveSession()
             }
         }
+    }
+
+    private suspend fun restoreWorkspaceGateForActiveSession() {
+        val sessionManager = SecureFolderApp.instance.sessionManager
+        when {
+            sessionManager.isPrimarySession() -> profileManager.setProfileLocked(false)
+            sessionManager.isDecoySession() -> profileManager.setProfileLocked(true)
+        }
+        appRepository.loadClonedApps()
     }
 
     fun dispatchCrossProfileCommand(
@@ -299,8 +314,12 @@ class FolderHomeViewModel : ViewModel() {
     }
 
     fun launchApp(app: ClonedApp) {
+        // Deliberate workspace launch belongs to the current authenticated session. Keep a bounded
+        // lease so MainActivity's foreground-leave hook does not immediately suspend the app.
+        com.example.ExternalSystemFlowLease.acquireLease(120_000L)
         val launched = appRepository.launchClonedApp(app)
         if (!launched) {
+            com.example.ExternalSystemFlowLease.releaseLease()
             _uiState.value = _uiState.value.copy(
                 statusMessage = "Không thể mở ứng dụng trong Private Workspace. Kiểm tra trạng thái hồ sơ."
             )

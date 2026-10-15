@@ -61,6 +61,8 @@ class AppRepository(
             val pkg = activity.applicationInfo.packageName
             if (pkg == context.packageName) continue
             if (activePackages.contains(pkg)) continue // Deduplicate by package name
+            val isSystemApp = (activity.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+            if (isSystemApp) continue // Work Profile infrastructure is not a user-cloned secret app.
             activePackages.add(pkg)
 
             list.add(
@@ -69,14 +71,19 @@ class AppRepository(
                     appLabel = activity.label.toString(),
                     componentClassName = activity.componentName.className,
                     isWorkProfile = true,
-                    isSystemApp = (activity.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
+                    isSystemApp = false,
                     icon = activity.getBadgedIcon(0)
                 )
             )
         }
 
-        // Keep local cache in sync with verified OS truth
-        prefs.edit().putStringSet(KEY_CLONED_PACKAGES, activePackages).apply()
+        // Keep a durable package-name cache for the access gate. When the workspace is locked,
+        // LauncherApps intentionally returns no secret apps; that is not evidence that the packages
+        // were removed, so never erase a non-empty cache merely because the gate hid everything.
+        val cachedPackages = prefs.getStringSet(KEY_CLONED_PACKAGES, emptySet())?.toSet().orEmpty()
+        if (activePackages.isNotEmpty() || cachedPackages.isEmpty()) {
+            prefs.edit().putStringSet(KEY_CLONED_PACKAGES, activePackages).apply()
+        }
         _clonedApps.value = list.sortedBy { it.appLabel }
     }
 
@@ -161,6 +168,7 @@ class AppRepository(
         loadClonedApps()
         val verified = isPackageInWorkProfile(packageName)
         if (verified) {
+            profileManager.registerWorkspacePackage(packageName)
             refreshHostApps()
         }
         verified
@@ -176,6 +184,10 @@ class AppRepository(
         val stillExists = isPackageInWorkProfile(packageName)
         val success = !stillExists
         if (success) {
+            profileManager.unregisterWorkspacePackage(packageName)
+            val cached = prefs.getStringSet(KEY_CLONED_PACKAGES, emptySet())?.toMutableSet() ?: mutableSetOf()
+            cached.remove(packageName)
+            prefs.edit().putStringSet(KEY_CLONED_PACKAGES, cached).apply()
             refreshHostApps()
         }
         success

@@ -222,6 +222,13 @@ class ProvisioningManager(private val context: Context) {
                 PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
                 PackageManager.DONT_KILL_APP
             )
+            // The managed-profile package is a headless DPC/executor. Its normal launcher entry must
+            // never provide a second door around the Personal Vault PIN.
+            context.packageManager.setComponentEnabledSetting(
+                ComponentName(context, com.example.MainActivity::class.java),
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                PackageManager.DONT_KILL_APP
+            )
 
             // Rebuild only this DPC's cross-profile filters so upgrades cannot retain stale routing.
             dpm.clearCrossProfileIntentFilters(adminComponent)
@@ -229,6 +236,9 @@ class ProvisioningManager(private val context: Context) {
                 addAction(com.example.core.profile.CrossProfileBridge.ACTION_EXECUTE_COMMAND)
                 addCategory(Intent.CATEGORY_DEFAULT)
             }
+            // Android's constant name is counter-intuitive: MANAGED_CAN_ACCESS_PARENT is the
+            // direction that lets an Intent SENT FROM the parent profile resolve an Activity IN
+            // the managed profile. This is exactly our Personal Controller -> Managed Executor path.
             dpm.addCrossProfileIntentFilter(
                 adminComponent,
                 commandFilter,

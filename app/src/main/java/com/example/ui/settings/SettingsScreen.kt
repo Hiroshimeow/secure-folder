@@ -89,6 +89,7 @@ fun SettingsScreen(
     val scope = rememberCoroutineScope()
 
     var showChangePinDialog by remember { mutableStateOf(false) }
+    var showDecoyPinDialog by remember { mutableStateOf(false) }
     var showResetDialog by remember { mutableStateOf(false) }
 
     BackHandler { onBack() }
@@ -148,6 +149,20 @@ fun SettingsScreen(
 
                     SettingsDivider()
 
+                    SettingsRowItem(
+                        icon = Icons.Default.Password,
+                        title = if (settings.isDecoyPinSetup) "Đổi PIN giả" else "Thiết lập PIN giả",
+                        subtitle = if (settings.isDecoyPinSetup) {
+                            "PIN phụ mở kho DECOY riêng; không mở app clone thật"
+                        } else {
+                            "Tạo mật khẩu phụ mở một kho giả tách biệt"
+                        },
+                        onClick = { showDecoyPinDialog = true },
+                        testTag = "decoy_pin_item"
+                    )
+
+                    SettingsDivider()
+
                     SettingsSwitchItem(
                         icon = Icons.Default.Fingerprint,
                         title = "Mở khóa bằng Sinh trắc học",
@@ -193,6 +208,59 @@ fun SettingsScreen(
                             }
                         }
                     )
+
+                    SettingsDivider()
+
+                    SettingsSwitchItem(
+                        icon = Icons.Default.Security,
+                        title = "Lắc để ẩn ngay",
+                        subtitle = "Khóa Vault và ẩn/suspend toàn bộ app clone khi phát hiện thao tác lắc",
+                        checked = settings.shakeToHideEnabled,
+                        onCheckedChange = { settingsRepo.setShakeToHideEnabled(it) }
+                    )
+
+                    SettingsDivider()
+
+                    SettingsRowItem(
+                        icon = Icons.Default.Shield,
+                        title = "Độ nhạy lắc",
+                        subtitle = when (settings.shakeSensitivity) {
+                            1 -> "Thấp · cần lắc mạnh"
+                            3 -> "Cao · phản ứng nhanh"
+                            else -> "Trung bình"
+                        },
+                        onClick = {
+                            val next = if (settings.shakeSensitivity >= 3) 1 else settings.shakeSensitivity + 1
+                            settingsRepo.setShakeSensitivity(next)
+                        }
+                    )
+
+                    SettingsDivider()
+
+                    SettingsSwitchItem(
+                        icon = Icons.Default.LockClock,
+                        title = "Úp máy để ẩn",
+                        subtitle = "Giữ điện thoại úp xuống ${settings.faceDownDelayMillis} ms để khóa khẩn cấp",
+                        checked = settings.faceDownToHideEnabled,
+                        onCheckedChange = { settingsRepo.setFaceDownToHideEnabled(it) }
+                    )
+
+                    SettingsDivider()
+
+                    SettingsRowItem(
+                        icon = Icons.Default.LockClock,
+                        title = "Thời gian úp máy",
+                        subtitle = "${settings.faceDownDelayMillis} ms",
+                        onClick = {
+                            val next = when (settings.faceDownDelayMillis) {
+                                500L -> 1000L
+                                1000L -> 1500L
+                                1500L -> 2000L
+                                else -> 500L
+                            }
+                            settingsRepo.setFaceDownDelayMillis(next)
+                        }
+                    )
                 }
             }
 
@@ -216,8 +284,8 @@ fun SettingsScreen(
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     StatusRow(
-                        label = "Cơ chế đóng băng tiến trình",
-                        value = "DevicePolicyManager.setProfileEnabled"
+                        label = "Cổng khóa ứng dụng clone",
+                        value = "DPC hide + suspend packages"
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     StatusRow(
@@ -325,6 +393,104 @@ fun SettingsScreen(
         )
     }
 
+    // Decoy PIN Dialog
+    if (showDecoyPinDialog) {
+        var decoyPin by remember { mutableStateOf("") }
+        var confirmDecoyPin by remember { mutableStateOf("") }
+        var decoyError by remember { mutableStateOf<String?>(null) }
+
+        AlertDialog(
+            onDismissRequest = { showDecoyPinDialog = false },
+            containerColor = OneUiDarkSurface,
+            title = {
+                Text(
+                    text = if (settings.isDecoyPinSetup) "Đổi PIN giả" else "Thiết lập PIN giả",
+                    color = OneUiDarkTextPrimary,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "PIN giả phải có cùng độ dài với PIN thật (${settings.pinLength} số). Nó mở một kho DECOY riêng và không bao giờ mở ứng dụng clone thật.",
+                        color = OneUiDarkTextSecondary,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedTextField(
+                        value = decoyPin,
+                        onValueChange = {
+                            if (it.length <= settings.pinLength && it.all { ch -> ch.isDigit() }) decoyPin = it
+                        },
+                        label = { Text("PIN giả", color = OneUiDarkTextSecondary) },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = OneUiTealPrimary,
+                            unfocusedBorderColor = OneUiDarkBorder,
+                            focusedTextColor = OneUiDarkTextPrimary,
+                            unfocusedTextColor = OneUiDarkTextPrimary
+                        )
+                    )
+                    OutlinedTextField(
+                        value = confirmDecoyPin,
+                        onValueChange = {
+                            if (it.length <= settings.pinLength && it.all { ch -> ch.isDigit() }) confirmDecoyPin = it
+                        },
+                        label = { Text("Xác nhận PIN giả", color = OneUiDarkTextSecondary) },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = OneUiTealPrimary,
+                            unfocusedBorderColor = OneUiDarkBorder,
+                            focusedTextColor = OneUiDarkTextPrimary,
+                            unfocusedTextColor = OneUiDarkTextPrimary
+                        )
+                    )
+                    if (decoyError != null) {
+                        Text(decoyError ?: "", color = OneUiLockRed, fontSize = 12.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        when {
+                            decoyPin.length != settings.pinLength -> {
+                                decoyError = "PIN giả phải có đúng ${settings.pinLength} chữ số."
+                            }
+                            decoyPin != confirmDecoyPin -> {
+                                decoyError = "PIN xác nhận không khớp."
+                            }
+                            else -> scope.launch {
+                                if (settingsRepo.setDecoyPin(decoyPin)) {
+                                    showDecoyPinDialog = false
+                                    snackbarHostState.showSnackbar("Đã cập nhật PIN giả")
+                                } else {
+                                    decoyError = "PIN giả không hợp lệ hoặc trùng PIN thật."
+                                }
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = OneUiTealPrimary)
+                ) {
+                    Text("Lưu", color = Color.White)
+                }
+            },
+            dismissButton = {
+                if (settings.isDecoyPinSetup) {
+                    TextButton(onClick = {
+                        settingsRepo.clearDecoyPin()
+                        showDecoyPinDialog = false
+                    }) {
+                        Text("Tắt PIN giả", color = OneUiLockRed)
+                    }
+                } else {
+                    TextButton(onClick = { showDecoyPinDialog = false }) {
+                        Text("Hủy", color = OneUiDarkTextSecondary)
+                    }
+                }
+            }
+        )
+    }
+
     // Reset Secure Folder Dialog (P0.06 fix: Real wipe of files and keys)
     if (showResetDialog) {
         AlertDialog(
@@ -347,9 +513,9 @@ fun SettingsScreen(
                 Button(
                     onClick = {
                         scope.launch {
-                            val wipeSuccess = SecureFolderApp.instance.vaultRepository.wipeAllVaultData()
+                            val wipeSuccess = SecureFolderApp.instance.vaultRepository.wipeAllVaultNamespaces()
                             if (wipeSuccess) {
-                                SecureFolderApp.instance.keyStoreManager.deleteKey()
+                                SecureFolderApp.instance.keyStoreManager.deleteAllKeys()
                                 settingsRepo.resetAllSettings()
                                 SecureFolderApp.instance.sessionManager.invalidateSession()
                                 SecureFolderApp.instance.profileManager.setProfileLocked(true)

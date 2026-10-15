@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.ResultReceiver
 import android.os.UserManager
 import android.provider.OpenableColumns
 import android.provider.Settings
@@ -37,11 +38,17 @@ class ManagedExecutorActivity : Activity() {
         private const val STATE_COMMAND = "state_command"
         private const val STATE_PACKAGE = "state_package"
         private const val STATE_APK_URIS = "state_apk_uris"
+        private const val STATE_PROTECTED_PACKAGES = "state_protected_packages"
+        private const val STATE_GATE_EPOCH = "state_gate_epoch"
+        private const val STATE_GATE_RESULT_RECEIVER = "state_gate_result_receiver"
     }
 
     private var pendingCommand: String? = null
     private var pendingPackage: String? = null
     private var pendingApkUris: ArrayList<Uri> = arrayListOf()
+    private var pendingProtectedPackages: ArrayList<String> = arrayListOf()
+    private var pendingGateEpoch: Long = 0L
+    private var pendingGateResultReceiver: ResultReceiver? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,18 +69,30 @@ class ManagedExecutorActivity : Activity() {
             return
         }
 
-        if (savedInstanceState != null) {
-            // Do not launch a duplicate installer/uninstaller after Activity recreation.
+        if (savedInstanceState != null && !isWorkspaceGateCommand()) {
+            // Installer/uninstaller flows must not be relaunched after recreation. Workspace gate
+            // commands are different: they are idempotent by epoch and must never be dropped.
             return
         }
 
         dispatchPendingCommand()
     }
 
+    private fun isWorkspaceGateCommand(): Boolean {
+        return pendingCommand == CrossProfileBridge.COMMAND_LOCK_APPS ||
+            pendingCommand == CrossProfileBridge.COMMAND_UNLOCK_APPS
+    }
+
     private fun dispatchPendingCommand() {
+        Log.i(
+            TAG,
+            "Dispatch command=$pendingCommand epoch=$pendingGateEpoch protected=${pendingProtectedPackages.size}"
+        )
         when (pendingCommand) {
             CrossProfileBridge.COMMAND_CLONE -> startCloneFlow()
             CrossProfileBridge.COMMAND_REMOVE -> startRemoveFlow()
+            CrossProfileBridge.COMMAND_LOCK_APPS -> setWorkspaceAppsLocked(true)
+            CrossProfileBridge.COMMAND_UNLOCK_APPS -> setWorkspaceAppsLocked(false)
             else -> finishWithResult(
                 false,
                 "Unrecognized cross-profile command: $pendingCommand"
@@ -105,16 +124,22 @@ class ManagedExecutorActivity : Activity() {
         outState.putString(STATE_COMMAND, pendingCommand)
         outState.putString(STATE_PACKAGE, pendingPackage)
         outState.putParcelableArrayList(STATE_APK_URIS, pendingApkUris)
+        outState.putStringArrayList(STATE_PROTECTED_PACKAGES, pendingProtectedPackages)
+        outState.putLong(STATE_GATE_EPOCH, pendingGateEpoch)
+        outState.putParcelable(STATE_GATE_RESULT_RECEIVER, pendingGateResultReceiver)
         super.onSaveInstanceState(outState)
     }
 
     private fun restoreState(savedInstanceState: Bundle?, sourceIntent: Intent) {
-        pendingCommand = savedInstanceState?.getString(STATE_COMMAND)
-            ?: sourceIntent.getStringExtra(CrossProfileBridge.EXTRA_COMMAND)
+        // A newly delivered cross-profile command must win over restored Activity state. Otherwise
+        // Samsung can recreate this singleTop activity with an old LOCK bundle and silently turn a
+        // newer UNLOCK into another LOCK.
+        pendingCommand = sourceIntent.getStringExtra(CrossProfileBridge.EXTRA_COMMAND)
             ?: sourceIntent.getStringExtra(STATE_COMMAND)
-        pendingPackage = savedInstanceState?.getString(STATE_PACKAGE)
-            ?: sourceIntent.getStringExtra(CrossProfileBridge.EXTRA_TARGET_PACKAGE)
+            ?: savedInstanceState?.getString(STATE_COMMAND)
+        pendingPackage = sourceIntent.getStringExtra(CrossProfileBridge.EXTRA_TARGET_PACKAGE)
             ?: sourceIntent.getStringExtra(STATE_PACKAGE)
+            ?: savedInstanceState?.getString(STATE_PACKAGE)
 
         pendingApkUris = when {
             savedInstanceState != null -> getUriList(savedInstanceState, STATE_APK_URIS)
@@ -129,6 +154,18 @@ class ManagedExecutorActivity : Activity() {
                 }
             }
         }
+        pendingProtectedPackages = sourceIntent.getStringArrayListExtra(CrossProfileBridge.EXTRA_PROTECTED_PACKAGES)
+            ?: savedInstanceState?.getStringArrayList(STATE_PROTECTED_PACKAGES)
+            ?: arrayListOf()
+        pendingGateEpoch = if (sourceIntent.hasExtra(CrossProfileBridge.EXTRA_GATE_EPOCH)) {
+            sourceIntent.getLongExtra(CrossProfileBridge.EXTRA_GATE_EPOCH, 0L)
+        } else {
+            savedInstanceState?.getLong(STATE_GATE_EPOCH, 0L) ?: 0L
+        }
+        pendingGateResultReceiver = getResultReceiver(
+            sourceIntent,
+            CrossProfileBridge.EXTRA_GATE_RESULT_RECEIVER
+        ) ?: getResultReceiver(savedInstanceState, STATE_GATE_RESULT_RECEIVER)
     }
 
     private fun isAuthorizedManagedExecutor(): Boolean {
@@ -141,6 +178,26 @@ class ManagedExecutorActivity : Activity() {
         }
     }
 
+    private fun setWorkspaceAppsLocked(locked: Boolean) {
+        val controller = com.example.SecureFolderApp.instance.workspaceAccessController
+        val result = if (locked) {
+            controller.lockAll(pendingProtectedPackages, pendingGateEpoch)
+        } else {
+            controller.unlockAll(pendingProtectedPackages, pendingGateEpoch)
+        }
+        pendingGateResultReceiver?.send(
+            if (result.success) RESULT_OK else RESULT_CANCELED,
+            Bundle().apply {
+                putLong(CrossProfileBridge.EXTRA_GATE_EPOCH, pendingGateEpoch)
+                putBoolean(CrossProfileBridge.EXTRA_RESULT_SUCCESS, result.success)
+            }
+        )
+        finishWithResult(
+            result.success,
+            if (result.success) null else "Workspace access gate failed for: ${result.failedPackages.joinToString()}"
+        )
+    }
+
     private fun startCloneFlow() {
         val target = pendingPackage
         if (target.isNullOrBlank()) {
@@ -149,6 +206,7 @@ class ManagedExecutorActivity : Activity() {
         }
 
         if (isPackageInstalledForCurrentProfile(target)) {
+            com.example.SecureFolderApp.instance.workspaceAccessController.registerProtectedPackage(target)
             finishWithResult(true, null)
             return
         }
@@ -330,6 +388,7 @@ class ManagedExecutorActivity : Activity() {
                     isPackageInstalledForCurrentProfile(target)
 
                 if (verified) {
+                    com.example.SecureFolderApp.instance.workspaceAccessController.registerProtectedPackage(target)
                     Log.i(TAG, "PackageInstaller success verified for $target")
                     finishWithResult(true, null)
                 } else {
@@ -361,6 +420,7 @@ class ManagedExecutorActivity : Activity() {
         }
 
         if (!isPackageInstalledForCurrentProfile(target)) {
+            com.example.SecureFolderApp.instance.workspaceAccessController.unregisterProtectedPackage(target)
             finishWithResult(true, null)
             return
         }
@@ -407,6 +467,7 @@ class ManagedExecutorActivity : Activity() {
 
                 val stillInstalled = isPackageInstalledForCurrentProfile(target)
                 if (!stillInstalled) {
+                    com.example.SecureFolderApp.instance.workspaceAccessController.unregisterProtectedPackage(target)
                     Log.i(TAG, "Managed-profile uninstall verified for $target")
                     finishWithResult(true, null)
                 } else {
@@ -444,6 +505,25 @@ class ManagedExecutorActivity : Activity() {
         }
         setResult(if (success) RESULT_OK else RESULT_CANCELED, resultIntent)
         finish()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun getResultReceiver(sourceIntent: Intent, key: String): ResultReceiver? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            sourceIntent.getParcelableExtra(key, ResultReceiver::class.java)
+        } else {
+            sourceIntent.getParcelableExtra(key)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun getResultReceiver(sourceBundle: Bundle?, key: String): ResultReceiver? {
+        if (sourceBundle == null) return null
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            sourceBundle.getParcelable(key, ResultReceiver::class.java)
+        } else {
+            sourceBundle.getParcelable(key)
+        }
     }
 
     private fun getClipUris(sourceIntent: Intent): ArrayList<Uri> {

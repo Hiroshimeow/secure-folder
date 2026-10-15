@@ -1,6 +1,7 @@
-package com.example.core.crypto
+﻿package com.example.core.crypto
 
 import com.example.SecureFolderApp
+import com.example.core.session.VaultSessionMode
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -42,9 +43,15 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
 
     private fun assertAuthorized() {
         val sessionMgr = SecureFolderApp.instance.sessionManager
-        if (!sessionMgr.isAuthenticated.value) {
+        if (!sessionMgr.isAuthenticated.value || sessionMgr.sessionMode.value == null) {
             throw SecurityException("Cryptographic access denied: Vault session is locked or unauthenticated")
         }
+    }
+
+    private fun activeSecretKey() = when (SecureFolderApp.instance.sessionManager.sessionMode.value) {
+        VaultSessionMode.PRIMARY -> keyStoreManager.getOrCreateMasterKey()
+        VaultSessionMode.DECOY -> keyStoreManager.getOrCreateDecoyKey()
+        null -> throw SecurityException("Cryptographic access denied: No active vault identity")
     }
 
     fun encrypt(plainBytes: ByteArray): ByteArray {
@@ -63,7 +70,7 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
 
     fun encryptStream(input: InputStream, output: OutputStream) {
         assertAuthorized()
-        val secretKey = keyStoreManager.getOrCreateMasterKey()
+        val secretKey = activeSecretKey()
         val streamId = ByteArray(STREAM_ID_LENGTH).also(secureRandom::nextBytes)
 
         output.write(MAGIC_V2)
@@ -144,7 +151,7 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
     }
 
     private fun decryptV2Stream(input: InputStream, output: OutputStream) {
-        val secretKey = keyStoreManager.getOrCreateMasterKey()
+        val secretKey = activeSecretKey()
         val streamId = ByteArray(STREAM_ID_LENGTH)
         if (readFully(input, streamId) != streamId.size) {
             throw SecurityException("Corrupted SFV2 stream: truncated stream id")
@@ -248,7 +255,7 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
     }
 
     private fun decryptV1Stream(input: InputStream, output: OutputStream) {
-        val secretKey = keyStoreManager.getOrCreateMasterKey()
+        val secretKey = activeSecretKey()
         val lenBytes = ByteArray(4)
 
         while (true) {
@@ -324,7 +331,7 @@ class VaultCipher(private val keyStoreManager: KeyStoreManager) {
     }
 
     private fun decryptLegacyStream(header: ByteArray, input: InputStream, output: OutputStream) {
-        val secretKey = keyStoreManager.getOrCreateMasterKey()
+        val secretKey = activeSecretKey()
         val iv = ByteArray(GCM_IV_LENGTH)
         System.arraycopy(header, 0, iv, 0, minOf(header.size, GCM_IV_LENGTH))
         val remainingIv = GCM_IV_LENGTH - header.size

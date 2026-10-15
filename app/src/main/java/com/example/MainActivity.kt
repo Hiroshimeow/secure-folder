@@ -13,6 +13,7 @@ import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -23,6 +24,8 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.core.profile.ManagedExecutorActivity
+import com.example.core.security.EmergencyMotionController
+import com.example.core.session.VaultSessionMode
 import com.example.ui.camera.SecureCameraScreen
 import com.example.ui.gallery.VaultGalleryScreen
 import com.example.ui.home.FolderHomeScreen
@@ -33,7 +36,6 @@ import com.example.ui.theme.SecureFolderTheme
 import com.example.viewmodel.FolderHomeViewModel
 import com.example.viewmodel.LockViewModel
 import com.example.viewmodel.VaultViewModel
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -85,8 +87,10 @@ class MainActivity : FragmentActivity() {
 
     private lateinit var lockViewModel: LockViewModel
     private lateinit var homeViewModel: FolderHomeViewModel
+    private var emergencyMotionController: EmergencyMotionController? = null
     private var lastBackgroundTimestamp: Long = 0L
     private var backgroundLockJob: Job? = null
+    private var startupLockDispatched: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -116,15 +120,35 @@ class MainActivity : FragmentActivity() {
             PackageManager.DONT_KILL_APP
         )
 
-        // The product has exactly two supported runtimes: personal controller and managed executor.
-        // Samsung Dual Messenger / clone profiles must never become a second Vault controller.
-        if (isUnsupportedSecondaryProfile) {
+        // MainActivity is user-facing only in the Personal profile. Component enablement is per-user,
+        // so the managed DPC remains installed and operational without exposing a second launcher icon.
+        val launcherComponent = ComponentName(this, MainActivity::class.java)
+        if (isManagedProfile || isUnsupportedSecondaryProfile) {
+            if (isManagedProfile) {
+                SecureFolderApp.instance.provisioningManager.ensureManagedProfileConfiguration()
+            }
+            packageManager.setComponentEnabledSetting(
+                launcherComponent,
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                PackageManager.DONT_KILL_APP
+            )
             finish()
             return
-        }
-
-        if (isManagedProfile) {
-            SecureFolderApp.instance.provisioningManager.ensureManagedProfileConfiguration()
+        } else {
+            packageManager.setComponentEnabledSetting(
+                launcherComponent,
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                PackageManager.DONT_KILL_APP
+            )
+            emergencyMotionController = EmergencyMotionController(this) {
+                runOnUiThread {
+                    if (::lockViewModel.isInitialized &&
+                        !SecureFolderApp.instance.settingsRepository.settings.value.isLocked
+                    ) {
+                        lockViewModel.lockVault()
+                    }
+                }
+            }
         }
 
         setContent {
@@ -140,10 +164,32 @@ class MainActivity : FragmentActivity() {
                     homeViewModel = viewModel()
 
                     val lockState by lockViewModel.uiState.collectAsState()
+                    val sessionMode by SecureFolderApp.instance.sessionManager.sessionMode.collectAsState()
+                    val settings by SecureFolderApp.instance.settingsRepository.settings.collectAsState()
                     var currentScreen by remember { mutableStateOf<Screen>(Screen.Home) }
 
+                    LaunchedEffect(lockState.isLocked, sessionMode) {
+                        if (lockState.isLocked || sessionMode == VaultSessionMode.DECOY) {
+                            currentScreen = Screen.Home
+                        }
+                    }
+
+                    LaunchedEffect(
+                        lockState.isLocked,
+                        settings.shakeToHideEnabled,
+                        settings.shakeSensitivity,
+                        settings.faceDownToHideEnabled,
+                        settings.faceDownDelayMillis
+                    ) {
+                        if (lockState.isLocked) {
+                            emergencyMotionController?.stop()
+                        } else {
+                            emergencyMotionController?.updateSettings(settings)
+                        }
+                    }
+
                     Crossfade(
-                        targetState = lockState.isLocked,
+                        targetState = lockState.isLocked || lockState.isSecuringWorkspace,
                         animationSpec = tween(350),
                         label = "LockTransition"
                     ) { locked ->
@@ -169,6 +215,7 @@ class MainActivity : FragmentActivity() {
                                         onLockFolder = {
                                             lockViewModel.lockVault()
                                         },
+                                        isDecoyMode = sessionMode == VaultSessionMode.DECOY,
                                         modifier = Modifier.fillMaxSize()
                                     )
                                 }
@@ -212,12 +259,24 @@ class MainActivity : FragmentActivity() {
         // Release lease upon returning to foreground
         ExternalSystemFlowLease.releaseLease()
 
+        val settings = SecureFolderApp.instance.settingsRepository.settings.value
+        if (!settings.isLocked) {
+            // A future explicit lock/background transition owns its own pre-dispatch.
+            startupLockDispatched = false
+        }
+        // A restarted Personal Controller always begins LOCKED in memory. Recover the managed
+        // package boundary once per Activity instance. The transient managed executor returns focus
+        // to this Activity, so an unguarded onResume() would otherwise create a lock-dispatch loop.
+        if (!wasSystemIntent && settings.isLocked && !startupLockDispatched) {
+            startupLockDispatched = true
+            SecureFolderApp.instance.profileManager.preDispatchWorkspaceLockFromForeground()
+        }
+
         if (::homeViewModel.isInitialized) {
             homeViewModel.checkProfileStatus()
         }
 
         // Check timeout auto-lock policy when returning to foreground
-        val settings = SecureFolderApp.instance.settingsRepository.settings.value
         if (!wasSystemIntent && settings.autoLockTimeoutMinutes > 0 && lastBackgroundTimestamp > 0L) {
             val elapsedMillis = System.currentTimeMillis() - lastBackgroundTimestamp
             val thresholdMillis = settings.autoLockTimeoutMinutes * 60 * 1000L
@@ -227,6 +286,31 @@ class MainActivity : FragmentActivity() {
                 }
             }
         }
+
+        if (!settings.isLocked) {
+            emergencyMotionController?.updateSettings(settings)
+        }
+    }
+
+    override fun onUserLeaveHint() {
+        // Home / user-initiated backgrounding arrives here immediately before onPause(). Android
+        // 10+ can block the Activity-based cross-profile command once this process is background,
+        // so pre-dispatch the confidentiality lock while our window is still visible. System flows
+        // and deliberate cloned-app launches hold a bounded lease and must not be auto-locked here.
+        val settings = SecureFolderApp.instance.settingsRepository.settings.value
+        if (!ExternalSystemFlowLease.isLeaseActive &&
+            !settings.isLocked &&
+            settings.autoLockTimeoutMinutes == 0 &&
+            ::lockViewModel.isInitialized
+        ) {
+            SecureFolderApp.instance.profileManager.preDispatchWorkspaceLockFromForeground()
+        }
+        super.onUserLeaveHint()
+    }
+
+    override fun onPause() {
+        emergencyMotionController?.stop()
+        super.onPause()
     }
 
     override fun onStop() {
@@ -248,11 +332,11 @@ class MainActivity : FragmentActivity() {
             // Proactively expire session in background when timer expires
             backgroundLockJob?.cancel()
             val delayMillis = settings.autoLockTimeoutMinutes * 60 * 1000L
-            backgroundLockJob = lifecycleScope.launch(Dispatchers.Default) {
+            backgroundLockJob = lifecycleScope.launch {
                 delay(delayMillis)
-                SecureFolderApp.instance.sessionManager.invalidateSession()
-                SecureFolderApp.instance.profileManager.setProfileLocked(true)
-                SecureFolderApp.instance.settingsRepository.setLocked(true)
+                if (::lockViewModel.isInitialized) {
+                    lockViewModel.lockVault()
+                }
             }
         }
     }

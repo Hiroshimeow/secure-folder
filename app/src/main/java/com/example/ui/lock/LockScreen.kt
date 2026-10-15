@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.LockClock
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -62,8 +63,8 @@ fun LockScreen(
     val activity = context as? FragmentActivity
 
     // Trigger biometrics only if enabled, vault is setup, and not disguised (P1.05 fix)
-    LaunchedEffect(state.isPinSetup, state.useBiometrics) {
-        if (!state.isDisguised && state.isPinSetup && state.useBiometrics && activity != null) {
+    LaunchedEffect(state.isPinSetup, state.useBiometrics, state.isSecuringWorkspace) {
+        if (!state.isSecuringWorkspace && !state.isDisguised && state.isPinSetup && state.useBiometrics && activity != null) {
             viewModel.promptBiometrics(activity)
         }
     }
@@ -73,14 +74,42 @@ fun LockScreen(
             .fillMaxSize()
             .background(OneUiDarkBackground)
     ) {
-        if (state.isDisguised && state.isPinSetup) {
-            CalculatorDisguiseView(viewModel = viewModel)
-        } else {
-            OneUiPinLockView(
+        when {
+            state.isSecuringWorkspace -> SecuringWorkspaceView()
+            state.isDisguised && state.isPinSetup -> CalculatorDisguiseView(viewModel = viewModel)
+            else -> OneUiPinLockView(
                 viewModel = viewModel,
                 activity = activity
             )
         }
+    }
+}
+
+@Composable
+private fun SecuringWorkspaceView() {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        CircularProgressIndicator(color = OneUiTealBright)
+        Spacer(modifier = Modifier.height(20.dp))
+        Text(
+            text = "Đang khóa không gian riêng tư…",
+            color = OneUiDarkTextPrimary,
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp,
+            textAlign = TextAlign.Center
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "Đang xác minh ứng dụng bí mật đã được ẩn và tạm dừng.",
+            color = OneUiDarkTextSecondary,
+            fontSize = 13.sp,
+            textAlign = TextAlign.Center
+        )
     }
 }
 

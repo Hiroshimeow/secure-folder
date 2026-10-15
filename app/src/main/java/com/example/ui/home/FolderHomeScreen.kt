@@ -119,6 +119,7 @@ fun FolderHomeScreen(
     onOpenCamera: () -> Unit,
     onOpenSettings: () -> Unit,
     onLockFolder: () -> Unit,
+    isDecoyMode: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -246,56 +247,57 @@ fun FolderHomeScreen(
                         )
                     }
 
-                    // Add Apps Button
-                    IconButton(
-                        onClick = { viewModel.openAddAppSheet() },
-                        modifier = Modifier.testTag("add_app_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Add,
-                            contentDescription = "Thêm ứng dụng",
-                            tint = OneUiDarkTextPrimary
-                        )
-                    }
+                    if (!isDecoyMode) {
+                        // Clone/workspace administration is never exposed from a decoy session.
+                        IconButton(
+                            onClick = { viewModel.openAddAppSheet() },
+                            modifier = Modifier.testTag("add_app_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Add,
+                                contentDescription = "Thêm ứng dụng",
+                                tint = OneUiDarkTextPrimary
+                            )
+                        }
 
-                    // Overflow Menu
-                    IconButton(onClick = { showMenu = true }) {
-                        Icon(
-                            imageVector = Icons.Default.MoreVert,
-                            contentDescription = "Tùy chọn",
-                            tint = OneUiDarkTextPrimary
-                        )
-                    }
+                        IconButton(onClick = { showMenu = true }) {
+                            Icon(
+                                imageVector = Icons.Default.MoreVert,
+                                contentDescription = "Tùy chọn",
+                                tint = OneUiDarkTextPrimary
+                            )
+                        }
 
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { showMenu = false },
-                        modifier = Modifier.background(OneUiDarkCard)
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Cài đặt Thư mục Bảo mật", color = OneUiDarkTextPrimary) },
-                            leadingIcon = { Icon(Icons.Default.Settings, null, tint = OneUiTealBright) },
-                            onClick = {
-                                showMenu = false
-                                onOpenSettings()
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Bộ sưu tập mã hóa", color = OneUiDarkTextPrimary) },
-                            leadingIcon = { Icon(Icons.Default.PhotoLibrary, null, tint = OneUiFolderBlue) },
-                            onClick = {
-                                showMenu = false
-                                onOpenVault(null)
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Máy ảnh an toàn", color = OneUiDarkTextPrimary) },
-                            leadingIcon = { Icon(Icons.Default.CameraAlt, null, tint = OneUiTealPrimary) },
-                            onClick = {
-                                showMenu = false
-                                onOpenCamera()
-                            }
-                        )
+                        DropdownMenu(
+                            expanded = showMenu,
+                            onDismissRequest = { showMenu = false },
+                            modifier = Modifier.background(OneUiDarkCard)
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Cài đặt Thư mục Bảo mật", color = OneUiDarkTextPrimary) },
+                                leadingIcon = { Icon(Icons.Default.Settings, null, tint = OneUiTealBright) },
+                                onClick = {
+                                    showMenu = false
+                                    onOpenSettings()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Bộ sưu tập mã hóa", color = OneUiDarkTextPrimary) },
+                                leadingIcon = { Icon(Icons.Default.PhotoLibrary, null, tint = OneUiFolderBlue) },
+                                onClick = {
+                                    showMenu = false
+                                    onOpenVault(null)
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Máy ảnh an toàn", color = OneUiDarkTextPrimary) },
+                                leadingIcon = { Icon(Icons.Default.CameraAlt, null, tint = OneUiTealPrimary) },
+                                onClick = {
+                                    showMenu = false
+                                    onOpenCamera()
+                                }
+                            )
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -316,23 +318,25 @@ fun FolderHomeScreen(
             verticalArrangement = Arrangement.spacedBy(20.dp),
             modifier = Modifier.fillMaxSize()
         ) {
-            // Enterprise Work Profile Status Banner
-            item(span = { GridItemSpan(4) }) {
-                WorkProfileStatusCard(
-                    state = state,
-                    onSetupWorkProfile = {
-                        try {
-                            provisioningLauncher.launch(viewModel.getProvisioningIntent())
-                        } catch (e: Exception) {
-                            scope.launch {
-                                snackbarHostState.showSnackbar("Thiết bị chưa hỗ trợ kích hoạt hồ sơ tự động.")
+            if (!isDecoyMode) {
+                // Enterprise Work Profile status is real-vault metadata and must never leak in decoy mode.
+                item(span = { GridItemSpan(4) }) {
+                    WorkProfileStatusCard(
+                        state = state,
+                        onSetupWorkProfile = {
+                            try {
+                                provisioningLauncher.launch(viewModel.getProvisioningIntent())
+                            } catch (e: Exception) {
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Thiết bị chưa hỗ trợ kích hoạt hồ sơ tự động.")
+                                }
                             }
+                        },
+                        onRefreshProfile = {
+                            viewModel.checkProfileStatus()
                         }
-                    },
-                    onRefreshProfile = {
-                        viewModel.checkProfileStatus()
-                    }
-                )
+                    )
+                }
             }
 
             // Built-in Vault Apps Header
@@ -382,8 +386,9 @@ fun FolderHomeScreen(
                 )
             }
 
-            // Cloned Apps Header
-            item(span = { GridItemSpan(4) }) {
+            if (!isDecoyMode) {
+                // Cloned app inventory belongs exclusively to the real vault identity.
+                item(span = { GridItemSpan(4) }) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -572,11 +577,12 @@ fun FolderHomeScreen(
                     )
                 }
             }
+            }
         }
     }
 
     // App Options Dialog (when long-pressing a cloned app)
-    if (selectedAppForMenu != null) {
+    if (!isDecoyMode && selectedAppForMenu != null) {
         val app = selectedAppForMenu!!
         AppOptionsBottomSheet(
             app = app,
@@ -593,7 +599,7 @@ fun FolderHomeScreen(
     }
 
     // Add Apps Modal Bottom Sheet
-    if (state.isAddAppSheetOpen) {
+    if (!isDecoyMode && state.isAddAppSheetOpen) {
         AddAppBottomSheet(
             viewModel = viewModel,
             onDismiss = { viewModel.closeAddAppSheet() },

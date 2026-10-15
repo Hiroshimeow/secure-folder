@@ -10,6 +10,7 @@ import android.content.pm.CrossProfileApps
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.util.Log
 import com.example.admin.ProvisioningManager
 import com.example.admin.SecureFolderAdminReceiver
 
@@ -37,15 +38,21 @@ class CrossProfileBridge(
     private val provisioningManager: ProvisioningManager
 ) {
     companion object {
+        private const val TAG = "CrossProfileBridge"
         const val ACTION_EXECUTE_COMMAND = "com.example.action.EXECUTE_COMMAND"
         const val EXTRA_COMMAND = "extra_command"
         const val EXTRA_TARGET_PACKAGE = "extra_target_package"
         const val EXTRA_RESULT_SUCCESS = "extra_result_success"
         const val EXTRA_ERROR_MESSAGE = "extra_error_message"
         const val EXTRA_APK_URIS = "extra_apk_uris"
+        const val EXTRA_PROTECTED_PACKAGES = "extra_protected_packages"
+        const val EXTRA_GATE_EPOCH = "extra_gate_epoch"
+        const val EXTRA_GATE_RESULT_RECEIVER = "extra_gate_result_receiver"
 
         const val COMMAND_CLONE = "clone_package"
         const val COMMAND_REMOVE = "remove_package"
+        const val COMMAND_LOCK_APPS = "lock_apps"
+        const val COMMAND_UNLOCK_APPS = "unlock_apps"
     }
 
     fun createCloneIntent(packageName: String, apkUris: ArrayList<Uri>): Intent {
@@ -78,6 +85,36 @@ class CrossProfileBridge(
             putExtra(EXTRA_COMMAND, COMMAND_REMOVE)
             putExtra(EXTRA_TARGET_PACKAGE, packageName)
             addCategory(Intent.CATEGORY_DEFAULT)
+        }
+    }
+
+    fun createWorkspaceLockIntent(packageNames: Collection<String>, gateEpoch: Long): Intent {
+        return Intent(ACTION_EXECUTE_COMMAND).apply {
+            putExtra(EXTRA_COMMAND, COMMAND_LOCK_APPS)
+            putStringArrayListExtra(EXTRA_PROTECTED_PACKAGES, ArrayList(packageNames.distinct()))
+            putExtra(EXTRA_GATE_EPOCH, gateEpoch)
+            addCategory(Intent.CATEGORY_DEFAULT)
+        }
+    }
+
+    fun createWorkspaceUnlockIntent(gateEpoch: Long): Intent {
+        return Intent(ACTION_EXECUTE_COMMAND).apply {
+            putExtra(EXTRA_COMMAND, COMMAND_UNLOCK_APPS)
+            putExtra(EXTRA_GATE_EPOCH, gateEpoch)
+            addCategory(Intent.CATEGORY_DEFAULT)
+        }
+    }
+
+    fun dispatchHeadless(commandIntent: Intent): Boolean {
+        if (provisioningManager.getWorkProfileUserHandle() == null) return false
+        return try {
+            context.startActivity(
+                Intent(commandIntent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            )
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Headless cross-profile dispatch unavailable: ${e.message}")
+            false
         }
     }
 

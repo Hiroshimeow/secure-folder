@@ -6,7 +6,9 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.ExternalSystemFlowLease
 import com.example.SecureFolderApp
+import com.example.core.session.VaultSessionMode
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -30,6 +32,7 @@ data class LockUiState(
     val firstEnteredPin: String = "",
     val errorMessage: String? = null,
     val isVerifying: Boolean = false,
+    val isSecuringWorkspace: Boolean = false,
     val calculatorDisplay: String = "0",
     val calculatorExpression: String = "",
     val failedAttempts: Int = 0,
@@ -127,12 +130,12 @@ class LockViewModel : ViewModel() {
         verificationJob?.cancel()
         verificationJob = viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isVerifying = true)
-            val isCorrect = settingsRepository.verifyPin(candidate)
+            val mode = settingsRepository.verifyPinRole(candidate)
             _uiState.value = _uiState.value.copy(isVerifying = false)
 
-            if (isCorrect) {
+            if (mode != null) {
                 _uiState.value = _uiState.value.copy(failedAttempts = 0)
-                unlockVault()
+                unlockVault(mode)
             } else {
                 handleFailedAttempt()
             }
@@ -168,7 +171,7 @@ class LockViewModel : ViewModel() {
                                 firstEnteredPin = "",
                                 errorMessage = null
                             )
-                            unlockVault()
+                            unlockVault(VaultSessionMode.PRIMARY)
                         }
                     }
                 } else {
@@ -225,12 +228,35 @@ class LockViewModel : ViewModel() {
         }
     }
 
-    fun unlockVault() {
+    fun unlockVault(mode: VaultSessionMode = VaultSessionMode.PRIMARY) {
         viewModelScope.launch {
-            // Start fresh authenticated session
-            SecureFolderApp.instance.sessionManager.startSession()
-            // Unfreeze profile
-            profileManager.setProfileLocked(false)
+            // The workspace gate is part of authentication, not an asynchronous UX decoration.
+            // Never create a DECOY/PRIMARY session until the required workspace state is secured.
+            val workspaceExists = SecureFolderApp.instance.provisioningManager.isWorkProfileActive()
+            val workspaceReady = if (workspaceExists) {
+                ExternalSystemFlowLease.acquireLease(5_000L)
+                if (mode == VaultSessionMode.PRIMARY) {
+                    profileManager.setProfileLocked(false)
+                } else {
+                    // Decoy sessions must never expose the real cloned-app workspace.
+                    profileManager.setProfileLocked(true)
+                }
+            } else {
+                true
+            }
+
+            if (!workspaceReady) {
+                SecureFolderApp.instance.sessionManager.invalidateSession()
+                settingsRepository.setLocked(true)
+                _uiState.value = _uiState.value.copy(
+                    isLocked = true,
+                    pinInput = "",
+                    errorMessage = "Không thể thiết lập ranh giới bảo mật của Private Workspace. Vault vẫn bị khóa."
+                )
+                return@launch
+            }
+
+            SecureFolderApp.instance.sessionManager.startSession(mode)
             settingsRepository.setLocked(false)
             _uiState.value = _uiState.value.copy(
                 isLocked = false,
@@ -243,12 +269,40 @@ class LockViewModel : ViewModel() {
     fun lockVault() {
         viewModelScope.launch {
             verificationJob?.cancel()
-            // Revoke and invalidate session token, purging RAM plaintext
+
+            // Conceal immediately, but only claim LOCKED after the Work Profile package gate is
+            // verified by OS truth. This prevents a false-security UI state.
+            _uiState.value = _uiState.value.copy(
+                isSecuringWorkspace = true,
+                pinInput = "",
+                calculatorDisplay = "0",
+                calculatorExpression = "",
+                errorMessage = null
+            )
+
+            val secured = if (SecureFolderApp.instance.provisioningManager.isWorkProfileActive()) {
+                // Executor becomes foreground briefly; do not let MainActivity.onStop recursively
+                // invoke another lock while this bounded security round-trip is in progress.
+                ExternalSystemFlowLease.acquireLease(5_000L)
+                profileManager.setProfileLocked(true)
+            } else {
+                true
+            }
+
+            if (!secured) {
+                _uiState.value = _uiState.value.copy(
+                    isSecuringWorkspace = false,
+                    isLocked = false,
+                    errorMessage = "Không thể xác minh Private Workspace đã khóa. Vui lòng thử lại."
+                )
+                return@launch
+            }
+
             SecureFolderApp.instance.sessionManager.invalidateSession()
-            // Freeze profile processes, suppress notifications
-            profileManager.setProfileLocked(true)
+            SecureFolderApp.instance.vaultRepository.clearVaultCacheOnLock()
             settingsRepository.setLocked(true)
             _uiState.value = _uiState.value.copy(
+                isSecuringWorkspace = false,
                 isLocked = true,
                 pinInput = "",
                 calculatorDisplay = "0",
@@ -281,12 +335,17 @@ class LockViewModel : ViewModel() {
                         (candidate2.length in 4..6 && candidate2.all { it.isDigit() })
 
                 viewModelScope.launch {
-                    val pass1 = if (candidate1.length in 4..6 && candidate1.all { it.isDigit() }) settingsRepository.verifyPin(candidate1) else false
-                    val pass2 = if (!pass1 && candidate2.length in 4..6 && candidate2.all { it.isDigit() }) settingsRepository.verifyPin(candidate2) else false
+                    val mode1 = if (candidate1.length in 4..6 && candidate1.all { it.isDigit() }) {
+                        settingsRepository.verifyPinRole(candidate1)
+                    } else null
+                    val mode2 = if (mode1 == null && candidate2.length in 4..6 && candidate2.all { it.isDigit() }) {
+                        settingsRepository.verifyPinRole(candidate2)
+                    } else null
+                    val resolvedMode = mode1 ?: mode2
 
-                    if (pass1 || pass2) {
+                    if (resolvedMode != null) {
                         _uiState.value = _uiState.value.copy(failedAttempts = 0)
-                        unlockVault()
+                        unlockVault(resolvedMode)
                     } else if (isCandidate && _uiState.value.isPinSetup) {
                         handleFailedAttempt()
                         if (_uiState.value.lockoutRemainingSeconds > 0) {
